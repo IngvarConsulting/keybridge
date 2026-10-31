@@ -10,16 +10,14 @@ outside the source tree and application bundle.
 
 ## Ingvar Consulting logo
 
-`Resources/interface/ingvar-consulting.png` is copied unchanged from
-[IngvarConsulting/efd_unpacker](https://github.com/IngvarConsulting/efd_unpacker/blob/08ecd2703b08343968032b464a609c424d9273c3/resources/ingvar-consulting.png).
-The [upstream license](https://github.com/IngvarConsulting/efd_unpacker/blob/08ecd2703b08343968032b464a609c424d9273c3/LICENSE)
-is MIT, with this copyright notice:
+`Resources/interface/ingvar-consulting.png` is the unchanged
+[primary logo (PNG)](https://ingvar.pro/brand/logos/wordmark-primary.png) from the
+official [Ingvar Consulting brandbook](https://ingvar.pro/brand).
 
-Copyright (c) 2024-2026 Ingvar Consulting
-
-The MIT permission and warranty terms in the accompanying `LICENSE` apply to
-this asset as well. Its original copyright notice is retained here. The logo
-identifies the developer in Settings; it is a local image with no remote load.
+The logo belongs to Ingvar Consulting and follows the brandbook's usage rules.
+The MIT license for KeyBridge's software is not a license grant for this logo.
+It identifies the developer in Settings and is bundled locally; displaying it
+does not load content from the website.
 
 ## Included free-software runtime
 
