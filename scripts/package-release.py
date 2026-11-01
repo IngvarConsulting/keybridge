@@ -35,27 +35,6 @@ def stream_digest(stream) -> str:
     return digest.hexdigest()
 
 
-def split_source_archive(source: Path, output: Path, name: str,
-                         part_bytes: int = 64 * 1024 * 1024) -> dict:
-    """Bound individual uploads; concatenation restores the original ZIP."""
-    if part_bytes <= 0:
-        raise ValueError("Source part size must be positive")
-    parts = []
-    combined = hashlib.sha256()
-    with source.open("rb") as stream:
-        for index, data in enumerate(iter(lambda: stream.read(part_bytes), b""), 1):
-            target = output / (name + f".{index:03d}")
-            target.write_bytes(data)
-            restored = target.read_bytes()
-            combined.update(restored)
-            parts.append({"name": target.name, "bytes": len(restored),
-                          "sha256": hashlib.sha256(restored).hexdigest()})
-    if not parts or combined.hexdigest() != sha256(source):
-        raise ValueError("Split sources do not reproduce the original archive")
-    return {"name": name, "bytes": source.stat().st_size,
-            "sha256": combined.hexdigest(), "parts": parts}
-
-
 def run(*args: str | Path) -> None:
     subprocess.run([str(arg) for arg in args], check=True)
 
@@ -288,13 +267,12 @@ def main() -> None:
         finally:
             run("/usr/bin/hdiutil", "detach", mount)
     source = auditor.export_source(output / (stem + "-source.zip"))
-    source_archives = [split_source_archive(path, output, stem + "-" + kind + "-sources.zip")
-                       for kind, path in (("runtime", args.runtime_sources), ("guest", args.guest_sources))]
+    for kind, path in (("runtime", args.runtime_sources), ("guest", args.guest_sources)):
+        shutil.copyfile(path, output / (stem + "-" + kind + "-sources.zip"))
     # GitHub normalizes non-ASCII asset filenames; keep published names stable.
     (output / "INSTALL.txt").write_text(instructions(args.version))
     report = {"version": args.version, "source_revision": revision,
               "application": audit, "corresponding_sources": coverage,
-              "source_archives": source_archives,
               "source": {k: source[k] for k in ("file_count", "bytes", "sha256")},
               "dmg_verified": True, "installed_copy_verified": True,
               "isolated_control_launch": True, "open_guest_boot_128_mib": True,
