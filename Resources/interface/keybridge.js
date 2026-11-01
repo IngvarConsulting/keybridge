@@ -3,7 +3,7 @@
 // pending UI requests and feedback; it never starts a VM or fabricates a result.
 (function (global) {
 'use strict';
-const initial = {phase:'loading',tab:'main',prepared:false,client:'unknown',clientRestored:false,key:false,want:false,hold:false,auto:false,permission:'unknown',proof:'none',saved:true,selected:'current',step:0,updated:false,previousAvailable:false,updateProblem:false,previousValid:false,backupAvailable:false,pendingQuit:false,pendingAuto:null,errorMessage:'',accessError:null,safetyBlock:null,contextVersion:'',operationPending:false,installationOpen:false,help:'',setupStep:'installer',diagnosing:false,detailTrail:[],navigation:[],editing:false,replacing:false,reviewSettings:false,dismissedError:null};
+const initial = {phase:'loading',tab:'main',prepared:false,client:'unknown',clientRestored:false,key:false,want:false,hold:false,auto:false,autoAvailable:false,permission:'unknown',proof:'none',saved:true,selected:'current',step:0,updated:false,previousAvailable:false,updateProblem:false,previousValid:false,backupAvailable:false,pendingQuit:false,pendingAuto:null,errorMessage:'',accessError:null,safetyBlock:null,contextVersion:'',operationPending:false,installationOpen:false,help:'',setupStep:'installer',diagnosing:false,detailTrail:[],navigation:[],editing:false,replacing:false,reviewSettings:false,dismissedError:null};
 const localKeys=new Set(['tab','help','setupStep','diagnosing','detailTrail','navigation','installationOpen','editing','replacing','reviewSettings','dismissedError','pendingAuto']);
 const domainKeys=Object.keys(initial).filter(k=>!localKeys.has(k));
 const scopes={'check-key':'key','check-space':'space','check-permission':'permission','check-client':'client',recheck:'safety',stop:'stop',quit:'stop',prepare:'install',monitor:'monitor',configure:'config',repair:'config',restore:'config',rollback:'config',measure:'resources'};
@@ -11,12 +11,13 @@ const commands=new Set(['installer','driver','prepare','start','stop','quit','co
 const emptyFile=()=>({name:'',valid:false,checking:false,error:'',message:'',validation:''});
 class BridgeState {
  constructor(){this.state={...initial,detailTrail:[],navigation:[]};this.files={installer:emptyFile(),driver:emptyFile()};this.keyLabel='';this.componentLabel='';this.proofTime='';this.resourceRows=[];this.resourcesNote='';this.results=new Map();this.pending=new Map();this.seen=new Set();this.sequence=0;this.epoch=0;this.autoSaved=false;this.autoError='';this.autoWorking=false;this.feedbackRevision=0;}
- signature(scope){const s=this.state;const values={key:[s.key,s.phase,s.contextVersion],space:[s.fault,s.contextVersion],permission:[s.permission],client:[s.client],install:[s.phase,this.files.installer.name,this.files.driver.name],stop:[s.phase,s.saved,s.hold],safety:[s.phase,s.safetyBlock,s.key,s.contextVersion],config:[s.client,s.phase,s.accessError,s.hold],monitor:[s.phase,s.contextVersion],resources:[s.contextVersion]};return JSON.stringify(values[scope]||[]);}
+ signature(scope){const s=this.state;const values={key:[s.key,s.phase,s.contextVersion],space:[s.fault,s.contextVersion],permission:[s.permission,s.autoAvailable],client:[s.client],install:[s.phase,this.files.installer.name,this.files.driver.name],stop:[s.phase,s.saved,s.hold],safety:[s.phase,s.safetyBlock,s.key,s.contextVersion],config:[s.client,s.phase,s.accessError,s.hold],monitor:[s.phase,s.contextVersion],resources:[s.contextVersion]};return JSON.stringify(values[scope]||[]);}
  result(scope){const item=this.results.get(scope);if(item&&item.signature===this.signature(scope))return item.text;this.results.delete(scope);return '';}
  record(scope,text){if(scope&&text)this.results.set(scope,{text:String(text),signature:this.signature(scope)});}
  clearResults(){this.results.clear();this.autoSaved=false;}
  request(action,value){
   if(!commands.has(action))return null;
+  if(!this.state.autoAvailable&&((action==='autostart'&&value===true)||action==='check-permission'))return null;
   const duplicate=[...this.pending.values()].find(p=>p.action===action);
   if(duplicate&&action!=='open-url'&&action!=='hide')return null;
   if(action==='stop'||action==='quit'){this.epoch++;this.pending.clear();this.autoWorking=false;this.state.pendingAuto=null;this.autoError='';this.clearResults();}
@@ -30,8 +31,15 @@ class BridgeState {
  }
  cancelAuto(){if(this.autoWorking)return;this.state.pendingAuto=null;this.autoError='';this.autoSaved=false;}
  update(payload={}){
-  const oldPhase=this.state.phase,oldContext=this.state.contextVersion;
+  const oldPhase=this.state.phase,oldContext=this.state.contextVersion,oldAutoAvailable=this.state.autoAvailable;
   for(const k of domainKeys)if(Object.prototype.hasOwnProperty.call(payload.state||{},k))this.state[k]=payload.state[k];
+  if(!this.state.autoAvailable){
+   for(const [id,request] of this.pending)if((request.action==='autostart'&&request.value===true)||request.action==='check-permission')this.pending.delete(id);
+   if(this.state.pendingAuto===true){this.state.pendingAuto=null;this.autoWorking=false;}
+   if(oldAutoAvailable){this.autoSaved=false;this.autoError='';}
+   if(this.state.help==='permission')this.state.help='';
+   this.state.navigation=this.state.navigation.map(entry=>entry.view?.help==='permission'?{...entry,view:{...entry.view,help:''}}:entry);
+  }
   if(payload.state&&Object.prototype.hasOwnProperty.call(payload.state,'fault'))this.state.fault=payload.state.fault;
   if(payload.state&&Object.prototype.hasOwnProperty.call(payload.state,'resumeReason'))this.state.resumeReason=payload.state.resumeReason;
   for(const kind of ['installer','driver'])if(payload.files?.[kind])this.files[kind]={...emptyFile(),...payload.files[kind]};
@@ -174,6 +182,7 @@ function clientConflict(){return lead('Настройки поиска лице�
 function autoExplanation(){
  if(model.autoWorking)return 'Сохраняем выбор… Текущая работа KeyBridge не меняется.';
  if(s.pendingAuto!==null)return (s.pendingAuto?(s.auto&&s.hold?'Возобновление':'Включение'):'Выключение')+' автозапуска не сохранено. Пока он '+(s.auto?(s.hold?'приостановлен':'включён'):'выключен')+'. '+e(model.autoError||'Повторите сохранение или отмените изменение.');
+ if(!s.autoAvailable)return s.auto?'Автозапуск недоступен в этой сборке. Сохранённый выбор можно выключить.':'Автозапуск недоступен в этой сборке. Открывайте KeyBridge вручную.';
  if(!s.auto)return 'Автозапуск выключен. Текущая работа KeyBridge не меняется.';
  if(s.hold)return 'Автозапуск приостановлен. При следующем входе KeyBridge останется выключенным, пока вы не разрешите запуск.';
  if(s.permission==='denied')return 'Для запуска при входе нужно разрешение macOS. Текущая работа KeyBridge не меняется.';
@@ -183,6 +192,7 @@ function autoExplanation(){
  return 'KeyBridge сможет включиться при следующем входе. Текущая работа KeyBridge не меняется.';
 }
 function permissionDetails(){
+ if(!s.autoAvailable)return `<section class="kb-permission" data-result-scope="permission">${row('Запуск при входе','Недоступен в этой сборке')}<p class="kb-setting-explain">Для автозапуска нужна сборка с подписью разработчика. Пока открывайте KeyBridge вручную.</p></section>`;
  const states={allowed:'Разрешена',denied:'Запрещена',unknown:'Не удалось проверить'};
  const explanation=s.permission==='allowed'?'macOS разрешает KeyBridge работать в фоне.':s.permission==='denied'?'Разрешите KeyBridge в настройках macOS → «Основные» → «Объекты входа», затем повторите проверку.':'macOS не ответила. Проверьте разрешение в настройках macOS → «Основные» → «Объекты входа».';
  return `<section class="kb-permission" data-result-scope="permission">${row('Фоновая работа',result('permission')||states[s.permission])}<p class="kb-setting-explain">${explanation}</p></section>`;
@@ -193,9 +203,10 @@ function company(){
 function settings(){
  let actions='';
  if(s.pendingAuto!==null)actions=button('Сохранить выбор','retry-auto',true,model.autoWorking)+button('Отмена','cancel-auto',false,model.autoWorking);
+ else if(!s.autoAvailable)actions='';
  else if(s.auto&&s.hold)actions=button('Возобновить автозапуск','resume-auto',true)+(s.permission!=='allowed'?button('Как разрешить фоновую работу','permission'):'');
  else if(s.permission!=='allowed')actions=button('Как разрешить фоновую работу','permission',true)+button('Проверить разрешение','check-permission');
- return `<div class="kb-lead"><h2>Настройки</h2></div><div class="kb-row kb-auto-row"><label class="kb-check"><input type="checkbox" id="kb-auto" ${(s.pendingAuto??s.auto)?'checked':''} ${busy()||model.autoWorking?'disabled':''}><span>Включать KeyBridge при входе в macOS<small>${autoExplanation()}</small></span></label><span class="kb-auto-feedback" data-saved="${model.autoSaved||s.pendingAuto!==null}">${model.autoWorking?'Сохраняем…':s.pendingAuto!==null?'Ошибка':'Сохранено'}</span></div>${permissionDetails()}<div class="kb-actions">${actions}</div>${s.client==='external'?clientConflict():''}${installation()}${company()}`;
+ return `<div class="kb-lead"><h2>Настройки</h2></div><div class="kb-row kb-auto-row"><label class="kb-check"><input type="checkbox" id="kb-auto" ${(s.pendingAuto??s.auto)?'checked':''} ${busy()||model.autoWorking||(!s.autoAvailable&&!s.auto)?'disabled':''}><span>Включать KeyBridge при входе в macOS<small>${autoExplanation()}</small></span></label><span class="kb-auto-feedback" data-saved="${model.autoSaved||s.pendingAuto!==null}">${model.autoWorking?'Сохраняем…':s.pendingAuto!==null?'Ошибка':'Сохранено'}</span></div>${permissionDetails()}<div class="kb-actions">${actions}</div>${s.client==='external'?clientConflict():''}${installation()}${company()}`;
 }
 function focusKey(el){
  if(!el||!(content.contains(el)||panel.contains(el)))return null;
@@ -299,6 +310,7 @@ function action(a){
  if(a==='close-diagnosis'){returnPage('diagnosis',()=>{s.diagnosing=false;s.help='';});return;}
  if(a==='close-help'){returnPage('help',()=>{s.help='';});return;}
  if(a==='manual-license'){enterPage('help',()=>{s.help='manual';});return;}
+ if(a==='permission'&&!s.autoAvailable)return;
  if(a==='storage-help'||a==='client-help'||a==='permission'){enterPage('help',()=>{s.help=a==='storage-help'?'storage':a==='client-help'?'client':'permission';});return;}
  if(a==='retry-auto'){if(s.pendingAuto!==null)send('autostart',s.pendingAuto);return;}
  if(a==='cancel-auto'){model.cancelAuto();render();return;}

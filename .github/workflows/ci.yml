@@ -42,6 +42,8 @@ jobs:
         run: node --test Tests/Interface/state.test.cjs
       - name: Test guest commands on fixtures
         run: python3 -m unittest discover -s Tests/Guest -p 'test_*.py'
+      - name: Test release packaging checks
+        run: python3 -m unittest discover -s Tests/Packaging -p 'test_*.py'
       - name: Check source export
         env:
           KEYBRIDGE_BUILD_ROOT: ${{ runner.temp }}/keybridge-source-check

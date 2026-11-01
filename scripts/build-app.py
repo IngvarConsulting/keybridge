@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Build a local ARM64 pilot. Python/Homebrew are build dependencies only.
+"""Build a self-contained ARM64 application. Python/Homebrew are build tools only.
 
 No user installer, VM, SSH identity, log, or 1C/Thales component is copied.
-The default is ad-hoc signing; --sign-identity enables a local development
-signature, required for SMAppService. Neither mode notarizes a public release.
+The default is ad-hoc signing; --sign-identity enables a Keychain identity.
+Neither mode notarizes the app. Public previews disclose this limitation.
 """
 from __future__ import annotations
 import argparse
@@ -269,7 +269,11 @@ def main() -> None:
     parser.add_argument("--runtime-only", action="store_true", help="Build/test relocated QEMU before Swift targets are ready")
     parser.add_argument("--output", type=Path, default=WORK / "KeyBridge.app")
     parser.add_argument("--sign-identity", default="-", help="Local Keychain signing identity; default ad-hoc does not support login launch")
+    parser.add_argument("--version", default="0.1.0", help="Three-part application version")
+    parser.add_argument("--build-number", default="1", help="Positive application build number")
     args = parser.parse_args()
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", args.version) or not re.fullmatch(r"[1-9][0-9]*", args.build_number):
+        raise RuntimeError("Expected --version major.minor.patch and a positive --build-number")
     if BUILD_ROOT == ROOT or ROOT in BUILD_ROOT.parents:
         raise RuntimeError("KEYBRIDGE_BUILD_ROOT must remain outside the source directory")
     if os.uname().machine != "arm64" or sys.platform != "darwin":
@@ -309,10 +313,10 @@ def main() -> None:
     resources.mkdir()
     entitlements = stage_parent / "qemu-entitlements.plist"
     entitlements.write_bytes(plistlib.dumps({"com.apple.security.cs.allow-jit": True, "com.apple.security.cs.disable-library-validation": True}))
-    info = {"CFBundleIdentifier": "pro.keybridge.pilot", "CFBundleName": "Ключ для 1С",
-            "CFBundleDisplayName": "Ключ для 1С", "CFBundleExecutable": "KeyBridgeApp",
-            "CFBundlePackageType": "APPL", "CFBundleShortVersionString": "0.1.0",
-            "CFBundleVersion": "1", "LSMinimumSystemVersion": "27.0",
+    info = {"CFBundleIdentifier": "pro.keybridge.pilot", "CFBundleName": "KeyBridge",
+            "CFBundleDisplayName": "KeyBridge", "CFBundleExecutable": "KeyBridgeApp",
+            "CFBundlePackageType": "APPL", "CFBundleShortVersionString": args.version,
+            "CFBundleVersion": args.build_number, "LSMinimumSystemVersion": "27.0",
             "LSUIElement": False, "NSHighResolutionCapable": True,
             "KeyBridgeLoginLaunchSupported": args.sign_identity != "-",
             "NSPrincipalClass": "NSApplication", "NSHumanReadableCopyright": "KeyBridge contributors; own code MIT"}
@@ -361,7 +365,7 @@ def main() -> None:
     app.rename(destination)
     entitlements.unlink()
     stage_parent.rmdir()
-    print(f"Built local pilot: {destination}")
+    print(f"Built KeyBridge {args.version} ({args.build_number}): {destination}")
     print("Included open Alpine base; no 1C/Thales, private key, user VM or user log.")
 
 

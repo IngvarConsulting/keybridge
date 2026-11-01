@@ -18,6 +18,21 @@ final class ControlSupportTests: XCTestCase {
         if let sandbox { try fm.removeItem(at: sandbox) }
     }
 
+    func testLoginCapabilityReadsEnclosingAppForHelpersAndRequiresBoolean() throws {
+        let executables=sandbox.appendingPathComponent("KeyBridge.app/Contents/MacOS",isDirectory:true)
+        try fm.createDirectory(at:executables,withIntermediateDirectories:true)
+        let info=executables.deletingLastPathComponent().appendingPathComponent("Info.plist")
+        XCTAssertFalse(ApplicationCapabilities.loginLaunchSupported(executableDirectory:executables))
+        for (value,expected):(Any,Bool) in [(true,true),(false,false),(1,false),("true",false)] {
+            let data=try PropertyListSerialization.data(fromPropertyList:["KeyBridgeLoginLaunchSupported":value],format:.binary,options:0)
+            try data.write(to:info)
+            XCTAssertEqual(ApplicationCapabilities.loginLaunchSupported(executableDirectory:executables),expected)
+        }
+        try Data("not a property list".utf8).write(to:info)
+        XCTAssertFalse(ApplicationCapabilities.loginLaunchSupported(executableDirectory:executables))
+        XCTAssertFalse(ApplicationCapabilities.loginLaunchSupported(executableDirectory:sandbox))
+    }
+
     func testImportRequestRoundTripPreservesPathsAndCannotBeReplayed() throws {
         let installer = sandbox.appendingPathComponent("my files/1C 'special' $(literal).run").path
         let driver = sandbox.appendingPathComponent("driver with spaces.deb").path

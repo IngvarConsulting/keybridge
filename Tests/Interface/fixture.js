@@ -1,8 +1,9 @@
 // Test-only native bridge. This file is never copied into the application bundle.
 'use strict';
 const fixture=document.querySelector('#fixture'),frame=document.querySelector('#application'),output=document.querySelector('#request');
-const empty={phase:'ready',prepared:true,client:'managed',clientRestored:false,key:true,want:true,hold:false,auto:false,permission:'allowed',proof:'none',saved:true,selected:'current',step:0,updated:false,previousAvailable:false,updateProblem:false,previousValid:false,backupAvailable:false,pendingQuit:false,errorMessage:'',accessError:null,safetyBlock:null,contextVersion:'fixture-A',operationPending:false,fault:null};
+const empty={phase:'ready',prepared:true,client:'managed',clientRestored:false,key:true,want:true,hold:false,auto:false,autoAvailable:true,permission:'allowed',proof:'none',saved:true,selected:'current',step:0,updated:false,previousAvailable:false,updateProblem:false,previousValid:false,backupAvailable:false,pendingQuit:false,errorMessage:'',accessError:null,safetyBlock:null,contextVersion:'fixture-A',operationPending:false,fault:null};
 const scenes={
+ autostart_unavailable:['Автозапуск недоступен в сборке',{phase:'stopped',want:false,autoAvailable:false,permission:'unsupported'}],
  ready:['Работает',{}],first:['Первый запуск',{phase:'first',prepared:false,client:'missing',key:false,want:false}],
  missing:['Клиент не найден',{phase:'stopped',client:'missing',want:false}],client_unknown:['Клиент неизвестен',{phase:'stopped',client:'unknown',want:false}],
  unconfigured:['Нужна настройка',{phase:'stopped',client:'unconfigured',want:false}],external:['Чужие настройки',{phase:'stopped',client:'external',want:false}],
@@ -27,7 +28,7 @@ function select(){
  request=null;state={...empty,...scenes[fixture.value][1]};files={installer:{name:'',valid:false},driver:{name:'',valid:false}};
  if(fixture.value==='invalid_installer')files.installer={name:'client-only.run',valid:false,error:'В установщике нет менеджера лицензий. Выберите полную поставку 1С.'};
  if(fixture.value==='invalid_driver'){files.installer={name:'setup-full-…-x86_64.run',valid:true,validation:'preliminary',message:'Формат подходит. Состав проверим при установке.'};files.driver={name:'aksusbd_arm64.deb',valid:false,error:'Архитектура arm64 не подходит. Выберите пакет amd64.'};}
- snapshot();frame.contentWindow.KeyBridge.navigate(['permission','permission_unknown','inhibited'].includes(fixture.value)?'settings':['unconfirmed','success','failure','probe_timeout','stale','probing'].includes(fixture.value)?'diagnosis':'main');output.textContent='Запросов нет';
+ snapshot();frame.contentWindow.KeyBridge.navigate(['permission','permission_unknown','inhibited','autostart_unavailable'].includes(fixture.value)?'settings':['unconfirmed','success','failure','probe_timeout','stale','probing'].includes(fixture.value)?'diagnosis':'main');output.textContent='Запросов нет';
 }
 frame.addEventListener('load',()=>{frame.contentWindow.webkit={messageHandlers:{keybridge:{postMessage(value){request=value;output.textContent=value.action;}}}};select();});
 fixture.addEventListener('change',select);

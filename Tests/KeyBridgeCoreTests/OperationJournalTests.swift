@@ -53,7 +53,7 @@ final class OperationJournalTests:XCTestCase {
         try intent.start();try intent.stop()
         let restored=try IntentStore(runtime:runtime)
         XCTAssertFalse(restored.value.want);XCTAssertTrue(restored.value.autoInhibit)
-        try restored.setAutostart(true)
+        try restored.setAutostart(true,supported:true)
         XCTAssertFalse(restored.value.autoInhibit);XCTAssertFalse(restored.value.want)
     }
     func testFailedIntentWriteCannotPretendToBeDurable() throws {
@@ -62,6 +62,24 @@ final class OperationJournalTests:XCTestCase {
         XCTAssertThrowsError(try store.stop())
         XCTAssertTrue(store.value.want)
         XCTAssertTrue(try IntentStore(runtime:runtime).value.want)
+    }
+    func testUnsupportedAutostartCannotPersistOrClearDurableStop() throws {
+        let store=try IntentStore(runtime:runtime)
+        try store.stop()
+        let path=runtime.appendingPathComponent("intent.json"),before=try Data(contentsOf:path)
+        XCTAssertThrowsError(try store.setAutostart(true,supported:false))
+        XCTAssertEqual(try Data(contentsOf:path),before)
+        XCTAssertFalse(store.value.autostart)
+        XCTAssertTrue(store.value.autoInhibit)
+    }
+    func testUnsupportedBuildCanDisablePreviouslySavedAutostart() throws {
+        let store=try IntentStore(runtime:runtime)
+        try store.setAutostart(true,supported:true)
+        try store.hold()
+        try store.setAutostart(false,supported:false)
+        let reloaded=try IntentStore(runtime:runtime)
+        XCTAssertFalse(reloaded.value.autostart)
+        XCTAssertTrue(reloaded.value.autoInhibit)
     }
     func testBudgetIsConsumedAndFailureDoesNotReplenishIt() throws {
         let store=try IntentStore(runtime:runtime);try store.start()

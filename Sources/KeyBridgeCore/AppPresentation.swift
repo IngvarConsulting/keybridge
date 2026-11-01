@@ -29,6 +29,7 @@ public enum AppPresentation {
             "phase": phase, "prepared": prepared, "client": client,
             "key": connected && !stale, "want": bool(status, "desiredRunning"),
             "hold": bool(status, "autoInhibit"), "auto": bool(status, "autostart"),
+            "autoAvailable": bool(status, "loginLaunchSupported"),
             "permission": ["allowed", "denied"].contains(string(status, "loginAccess")) ? string(status, "loginAccess") : "unknown",
             "proof": proof, "saved": saved, "selected": "current",
             "step": preparationStep(preparation?.phase ?? string(status, "phase")),

@@ -3,6 +3,17 @@ import XCTest
 @testable import KeyBridgeCore
 
 final class AppPresentationTests: XCTestCase {
+    func testAutostartCapabilityIsIndependentOfSavedChoiceAndOSPermission() {
+        var observed=running
+        observed["autostart"]=true
+        observed["loginAccess"]="allowed"
+        XCTAssertEqual(state(observed)["autoAvailable"] as?Bool,false)
+        observed["loginLaunchSupported"]=false
+        XCTAssertEqual(state(observed)["autoAvailable"] as?Bool,false)
+        XCTAssertEqual(state(observed)["auto"] as?Bool,true)
+        observed["loginLaunchSupported"]=true
+        XCTAssertEqual(state(observed)["autoAvailable"] as?Bool,true)
+    }
     private var running: [String: Any] {
         ["prepared": true, "running": true, "ownership": "owned", "status": "running",
          "keyConnected": true, "keyModel": "Observed key", "keyConnection": "connection-a", "clientState": "configured",

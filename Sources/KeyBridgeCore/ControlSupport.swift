@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 import Foundation
+import CoreFoundation
 import Darwin
 
 public struct BridgeError: LocalizedError {
@@ -23,6 +24,9 @@ public enum BridgePaths {
         return URL(fileURLWithPath: String(cString: path)).resolvingSymlinksInPath().deletingLastPathComponent()
     }
     public static var resources: URL { executableDirectory.deletingLastPathComponent().appendingPathComponent("Resources") }
+    public static var loginLaunchSupported: Bool {
+        ApplicationCapabilities.loginLaunchSupported(executableDirectory: executableDirectory)
+    }
     public static var platform: String { ClientInstallation.discover()?.executable.path ?? "/opt/1cv8/1cv8-not-installed" }
     public static var version: String { ClientInstallation.discover()?.version ?? "" }
     public static func preparePrivateDirectory(_ url: URL) throws {
@@ -33,6 +37,27 @@ public enum BridgePaths {
             try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         }
         guard chmod(url.path, 0o700) == 0 else { throw BridgeError("Не удалось ограничить доступ к данным приложения") }
+    }
+}
+
+public enum ApplicationCapabilities {
+    public static let autostartUnavailableMessage = "Автозапуск недоступен в этой сборке. Открывайте KeyBridge вручную."
+
+    /// Helpers have no reliable Bundle.main; read their enclosing application.
+    /// A missing, malformed or non-Boolean declaration never enables a feature.
+    public static func loginLaunchSupported(executableDirectory: URL) -> Bool {
+        let contents = executableDirectory.deletingLastPathComponent()
+        guard executableDirectory.lastPathComponent == "MacOS", contents.lastPathComponent == "Contents",
+              contents.deletingLastPathComponent().pathExtension == "app",
+              let data = try? Data(contentsOf: contents.appendingPathComponent("Info.plist")),
+              let info = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              let value = info["KeyBridgeLoginLaunchSupported"] as? NSNumber,
+              CFGetTypeID(value) == CFBooleanGetTypeID() else { return false }
+        return value.boolValue
+    }
+
+    public static func requireLoginLaunch(_ enabled: Bool, supported: Bool = BridgePaths.loginLaunchSupported) throws {
+        if enabled && !supported { throw BridgeError(autostartUnavailableMessage) }
     }
 }
 

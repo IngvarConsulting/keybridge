@@ -183,7 +183,8 @@ public final class IntentStore {
     public func consumeAttempt() throws {
         try update { $0.remaining=max(0,$0.remaining-1) }
     }
-    public func setAutostart(_ enabled:Bool) throws {
+    public func setAutostart(_ enabled:Bool, supported:Bool = BridgePaths.loginLaunchSupported) throws {
+        try ApplicationCapabilities.requireLoginLaunch(enabled, supported:supported)
         try update { $0.autostart=enabled;if enabled { $0.autoInhibit=false } }
     }
 }

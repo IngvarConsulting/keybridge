@@ -71,6 +71,7 @@ do {
     }
     if action == "autostart" {
         guard let mode=arguments.dropFirst().first,["on","off"].contains(mode) else { throw BridgeError("Укажите autostart on/off") }
+        try ApplicationCapabilities.requireLoginLaunch(mode == "on")
         request["enabled"] = mode == "on"
     }
     try ensureAgent()

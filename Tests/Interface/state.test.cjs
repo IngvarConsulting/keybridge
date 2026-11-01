@@ -2,10 +2,20 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {BridgeState} = require('../../Resources/interface/keybridge.js');
-const setup=()=>{const ui=new BridgeState();ui.update({state:{phase:'stopped',prepared:true,client:'managed',contextVersion:'A',auto:false,hold:true}});return ui;};
+const setup=()=>{const ui=new BridgeState();ui.update({state:{phase:'stopped',prepared:true,client:'managed',contextVersion:'A',auto:false,autoAvailable:true,hold:true}});return ui;};
 function complete(ui,request,ok,message='',state={}){return ui.update({state,feedback:{id:request.id,action:request.action,ok,message}});}
 test('A new window cannot claim work or license success before a native snapshot',()=>{
  const ui=new BridgeState();assert.equal(ui.state.phase,'loading');assert.equal(ui.state.prepared,false);assert.equal(ui.state.key,false);assert.equal(ui.state.proof,'none');
+});
+test('Unsupported or missing capability cannot request enabling or OS permission',()=>{
+ const ui=new BridgeState();assert.equal(ui.request('autostart',true),null);assert.equal(ui.request('check-permission'),null);assert.equal(ui.state.pendingAuto,null);
+ ui.update({state:{auto:true,permission:'allowed',autoAvailable:false}});assert.equal(ui.request('autostart',true),null);
+ const request=ui.request('autostart',false);assert.ok(request);complete(ui,request,false,'Write failed');ui.update({state:{autoAvailable:false}});assert.equal(ui.autoError,'Write failed');assert.equal(ui.state.pendingAuto,false);
+});
+test('Losing capability cancels stale enable feedback and permission guidance',()=>{
+ const ui=setup(),request=ui.request('autostart',true);ui.state.help='permission';
+ ui.update({state:{autoAvailable:false}});assert.equal(ui.state.help,'');assert.equal(ui.state.pendingAuto,null);assert.equal(ui.autoWorking,false);
+ complete(ui,request,true);assert.equal(ui.autoSaved,false);assert.equal(ui.state.auto,false);
 });
 test('Periodic observations preserve file wizard and nested navigation',()=>{
  const ui=setup();Object.assign(ui.state,{editing:true,replacing:true,setupStep:'driver',tab:'settings',help:'manual',detailTrail:['0','1'],navigation:[{kind:'detail'}]});

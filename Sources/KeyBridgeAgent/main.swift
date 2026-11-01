@@ -38,6 +38,7 @@ var stopAliases=[String:[String]]()
 var stopWriteErrors=[String:String]()
 
 func loginAccess()->String {
+    guard BridgePaths.loginLaunchSupported else { return "unsupported" }
     switch SMAppService.agent(plistName:"pro.keybridge.pilot.agent.plist").status {
     case .enabled:return "allowed"
     case .requiresApproval:return "denied"
@@ -54,7 +55,8 @@ func updateStatus(_ patch:[String:Any]) {
         state["autostart"]=desired.autostart;state["desiredRunning"]=desired.want
         state["autoInhibit"]=desired.autoInhibit;state["remainingAttempts"]=desired.remaining
     }
-    state["armed"]=authorization.allowed;state["loginAccess"]=loginAccess();state["sessionActive"]=sessionActive
+    state["armed"]=authorization.allowed;state["loginLaunchSupported"]=BridgePaths.loginLaunchSupported
+    state["loginAccess"]=loginAccess();state["sessionActive"]=sessionActive
     state["reconciling"] = state["operation"] as? String == "reconcile" && state["busy"] as? Bool == true
         && !(engine.hasConnectionContext && state["ownership"] as?String == "owned" && ["running","waiting-key"].contains(state["status"] as?String ?? ""))
     do { try writeObject(state,to:statusURL) }

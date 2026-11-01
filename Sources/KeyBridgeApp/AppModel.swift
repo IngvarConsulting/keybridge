@@ -133,6 +133,7 @@ final class AppModel: ObservableObject {
 
     private func publish() {
         var observed = state
+        observed["loginLaunchSupported"] = BridgePaths.loginLaunchSupported
         // The live agent knows current client state. On cold start the helper's
         // read-only inspection supplies it without launching the licensing VM.
         for (key, value) in client { observed[key] = value }
@@ -229,6 +230,10 @@ final class AppModel: ObservableObject {
         let mapping = ["check-key": "refresh-key", "recheck": "refresh-state", "check-permission": "refresh-state", "measure": "resources"]
         let allowed = ["prepare", "start", "stop", "probe", "configure", "repair", "restore", "rollback", "monitor", "autostart", "check-key", "check-client", "check-space", "recheck", "check-permission", "measure"]
         guard allowed.contains(action) else { return }
+        if !BridgePaths.loginLaunchSupported && ((action == "autostart" && value as? Bool == true) || action == "check-permission") {
+            feedback = ["id": id, "action": action, "ok": false, "message": ApplicationCapabilities.autostartUnavailableMessage]
+            publish(); return
+        }
         guard let ticket = flow.begin(id: id, action: action) else {
             feedback = ["id": id, "action": action, "ok": false, "message": "Дождитесь завершения текущего действия. Выключение доступно сразу."]
             publish(); return
