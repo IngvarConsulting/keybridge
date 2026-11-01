@@ -6,10 +6,15 @@ import WebKit
 @MainActor
 final class KeyBridgeWindowController: NSViewController, WKNavigationDelegate, WKScriptMessageHandler {
     private let model: AppModel
+    private let initialContentSize: NSSize
     private var webView: WKWebView!
     private var ready = false
     private var pendingNavigation: String?
-    init(model: AppModel) { self.model = model; super.init(nibName: nil, bundle: nil) }
+    init(model: AppModel, contentSize: NSSize) {
+        self.model = model
+        initialContentSize = contentSize
+        super.init(nibName: nil, bundle: nil)
+    }
     required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
 
     override func loadView() {
@@ -17,7 +22,7 @@ final class KeyBridgeWindowController: NSViewController, WKNavigationDelegate, W
         configuration.websiteDataStore = .nonPersistent()
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
         configuration.userContentController.add(WeakScriptHandler(self), name: "keybridge")
-        webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 760, height: 560), configuration: configuration)
+        webView = WKWebView(frame: NSRect(origin: .zero, size: initialContentSize), configuration: configuration)
         webView.navigationDelegate = self
         webView.allowsBackForwardNavigationGestures = false
         webView.setValue(false, forKey: "drawsBackground")
@@ -28,10 +33,6 @@ final class KeyBridgeWindowController: NSViewController, WKNavigationDelegate, W
             webView.topAnchor.constraint(equalTo: view.topAnchor), webView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             webView.leadingAnchor.constraint(equalTo: view.leadingAnchor), webView.trailingAnchor.constraint(equalTo: view.trailingAnchor)
         ])
-        let drag = WindowDragRegion()
-        drag.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(drag)
-        NSLayoutConstraint.activate([drag.topAnchor.constraint(equalTo: view.topAnchor), drag.leadingAnchor.constraint(equalTo: view.leadingAnchor), drag.widthAnchor.constraint(equalToConstant: 300), drag.heightAnchor.constraint(equalToConstant: 44)])
         model.didChange = { [weak self] value in self?.send(value) }
         model.navigate = { [weak self] destination in
             guard let self else { return }
@@ -76,10 +77,6 @@ final class KeyBridgeWindowController: NSViewController, WKNavigationDelegate, W
     }
 }
 
-private final class WindowDragRegion: NSView {
-    override func mouseDown(with event: NSEvent) { window?.performDrag(with: event) }
-    override func accessibilityHitTest(_ point: NSPoint) -> Any? { nil }
-}
 private final class WeakScriptHandler: NSObject, WKScriptMessageHandler {
     weak var target: WKScriptMessageHandler?
     init(_ target: WKScriptMessageHandler) { self.target = target }

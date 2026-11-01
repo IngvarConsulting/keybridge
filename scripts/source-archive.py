@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Export allowlisted source text and the developer logo; audit a local app.
+"""Export allowlisted source text and two named images; audit a local app.
 
 Never traverses the project to decide what to export. Runtime directories and
-user installers cannot be included through the source allowlist. The single
-PNG exception is validated separately; it does not allow other binary sources.
+user installers cannot be included through the source allowlist. The logo and
+app icon PNGs are validated separately; other binary sources are not allowed.
 """
 from __future__ import annotations
 import argparse
@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
 import stat
 import struct
@@ -23,7 +24,7 @@ import zlib
 ROOT = Path(__file__).resolve().parents[1]
 BUILD_ROOT = Path(os.environ.get("KEYBRIDGE_BUILD_ROOT", str(Path.home() / "Library/Caches/KeyBridgeDevelopment"))).expanduser().resolve()
 SOURCE_FILES = ("Package.swift", "README.md", "LICENSE", "THIRD_PARTY.md", ".gitignore",
-                "Resources/interface/ingvar-consulting.png")
+                "Resources/interface/ingvar-consulting.png", "Resources/app-icon.png")
 SOURCE_GLOBS = ("Sources/**/*.swift", "Resources/guest/*.py", "Resources/guest/*.sh",
                 "Resources/interface/*.html", "Resources/interface/*.js", "Resources/interface/*.css",
                 "Tests/Interface/*.js", "Tests/Interface/*.cjs", "Tests/Interface/*.html",
@@ -59,9 +60,10 @@ def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def validate_brand_png(data: bytes) -> None:
-    """Independently validate the sole binary source/UI asset."""
-    if len(data) > 1024 * 1024 or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+def validate_png(data: bytes, *, dimensions: tuple[int, int] | None = None,
+                 maximum: int = 1024 * 1024) -> None:
+    """Independently validate an explicitly allowed image's structure and size."""
+    if len(data) > maximum or not data.startswith(b"\x89PNG\r\n\x1a\n"):
         raise ValueError("Invalid brand PNG signature or size")
     cursor = 8
     seen_header = seen_image = False
@@ -80,7 +82,9 @@ def validate_brand_png(data: bytes) -> None:
                 raise ValueError("Missing brand PNG IHDR")
             width, height, depth, color, compression, filtering, interlace = struct.unpack(">IIBBBBB", body)
             valid_depths = {0: {1, 2, 4, 8, 16}, 2: {8, 16}, 3: {1, 2, 4, 8}, 4: {8, 16}, 6: {8, 16}}
-            if ((width, height) != (1240, 220) or depth not in valid_depths.get(color, set())
+            valid_size = ((width, height) == dimensions if dimensions is not None
+                          else width == height and 1024 <= width <= 4096)
+            if (not valid_size or depth not in valid_depths.get(color, set())
                     or compression or filtering or interlace not in (0, 1)):
                 raise ValueError("Unexpected brand PNG dimensions or encoding")
             seen_header = True
@@ -94,6 +98,44 @@ def validate_brand_png(data: bytes) -> None:
             return
         cursor = boundary
     raise ValueError("Incomplete brand PNG")
+
+
+def validate_brand_png(data: bytes) -> None:
+    validate_png(data, dimensions=(1240, 220))
+
+
+def validate_app_icns(data: bytes) -> None:
+    """Accept the bounded image container produced by native iconutil only."""
+    if (len(data) > 8 * 1024 * 1024 or data[:4] != b"icns" or len(data) < 8
+            or int.from_bytes(data[4:8], "big") != len(data)):
+        raise ValueError("Invalid application ICNS")
+    sizes = {b"icp4": 16, b"icp5": 32, b"icp6": 64, b"ic07": 128, b"ic08": 256,
+             b"ic09": 512, b"ic10": 1024, b"ic11": 32, b"ic12": 64, b"ic13": 256, b"ic14": 512}
+    cursor, seen, represented = 8, set(), set()
+    while cursor < len(data):
+        if cursor + 8 > len(data):
+            raise ValueError("Truncated application ICNS")
+        kind, size = struct.unpack_from(">4sI", data, cursor)
+        if size < 8 or cursor + size > len(data) or kind in seen:
+            raise ValueError("Malformed application ICNS element")
+        payload = data[cursor + 8:cursor + size]
+        if kind in sizes:
+            side = sizes[kind]
+            validate_png(payload, dimensions=(side, side), maximum=8 * 1024 * 1024)
+            represented.add(side)
+        elif kind in (b"ic04", b"ic05"):
+            if not payload.startswith(b"ARGB"):
+                raise ValueError("Invalid application ICNS bitmap")
+            represented.add(16 if kind == b"ic04" else 32)
+        elif kind == b"info":
+            if not isinstance(plistlib.loads(payload), dict):
+                raise ValueError("Invalid application ICNS metadata")
+        else:
+            raise ValueError("Unexpected application ICNS element")
+        seen.add(kind)
+        cursor += size
+    if not {16, 32, 128, 256, 512, 1024} <= represented:
+        raise ValueError("Application ICNS is missing required image sizes")
 
 
 def reject_symlink_chain(path: Path, base: Path) -> None:
@@ -123,6 +165,8 @@ def export_source(destination: Path) -> dict:
         data = path.read_bytes()
         if path.relative_to(ROOT).as_posix() == "Resources/interface/ingvar-consulting.png":
             validate_brand_png(data)
+        elif path.relative_to(ROOT).as_posix() == "Resources/app-icon.png":
+            validate_png(data, maximum=8 * 1024 * 1024)
         else:
             if data[:4] in FORBIDDEN_MAGICS or data[:2] == b"MZ" or b"\x00" in data:
                 raise ValueError("Binary source input rejected: " + path.name)
@@ -168,6 +212,8 @@ def approved_category(name: str) -> str | None:
         return "interface-source"
     if name == "Contents/Resources/interface/ingvar-consulting.png":
         return "brand-image"
+    if name == "Contents/Resources/AppIcon.icns":
+        return "app-icon"
     parts = p.parts
     if len(parts) == 5 and parts[:3] == ("Contents", "Resources", "ThirdParty") and parts[3] in PACKAGES:
         if (p.name in {"INSTALL_RECEIPT.json", "sbom.spdx.json"}
@@ -233,6 +279,11 @@ def audit_app(app: Path) -> dict:
                 validate_brand_png(data)
             except ValueError as exc:
                 bad_files.append({"file": name, "reason": str(exc)})
+        elif category == "app-icon":
+            try:
+                validate_app_icns(data)
+            except (ValueError, plistlib.InvalidFileException) as exc:
+                bad_files.append({"file": name, "reason": str(exc)})
         elif category not in {"firmware", "linux-image"}:
             if data[:4] in FORBIDDEN_MAGICS or data[:2] == b"MZ" or b"\x00" in data:
                 bad_files.append({"file": name, "reason": "binary in text/metadata allowlist"})
@@ -240,7 +291,7 @@ def audit_app(app: Path) -> dict:
                 bad_files.append({"file": name, "reason": "private key material"})
     required = ROOT_BUNDLE_FILES | {"Contents/MacOS/" + x for x in PRODUCTS}
     required |= {"Contents/Resources/interface/keybridge.html", "Contents/Resources/interface/keybridge.js",
-                 "Contents/Resources/interface/ingvar-consulting.png"}
+                 "Contents/Resources/interface/ingvar-consulting.png", "Contents/Resources/AppIcon.icns"}
     required |= {"Contents/Resources/runtime/bin/" + x for x in RUNTIME_EXECUTABLES}
     required |= {"Contents/Resources/runtime/lib/" + x for x in RUNTIME_LIBRARIES}
     required |= {"Contents/Resources/runtime/share/qemu/" + x for x in FIRMWARE}
@@ -250,6 +301,8 @@ def audit_app(app: Path) -> dict:
     for name in sorted(required - present):
         bad_files.append({"file": name, "reason": "required bundle file missing"})
     manifest_path = app / "Contents/Resources/build-inventory.json"
+    if plistlib.loads((app / "Contents/Info.plist").read_bytes()).get("CFBundleIconFile") != "AppIcon.icns":
+        bad_files.append({"file": "Contents/Info.plist", "reason": "application icon is not configured"})
     manifest = json.loads(manifest_path.read_text())
     expected_runtime = {name[len("Contents/Resources/"):] for name in required if "/runtime/" in name}
     recorded_runtime = {item["file"] for item in manifest.get("runtime_files", [])}

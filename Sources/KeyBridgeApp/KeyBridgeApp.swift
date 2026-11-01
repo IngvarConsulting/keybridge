@@ -16,22 +16,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     func showWindow() {
         if mainWindow == nil {
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 560),
-                                  styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            let style: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable]
+            let frame = NSRect(x: 0, y: 0, width: 760, height: 560)
+            let window = NSWindow(contentRect: NSWindow.contentRect(forFrameRect: frame, styleMask: style),
+                                  styleMask: style,
                                   backing: .buffered, defer: false)
             window.title = "KeyBridge"
-            window.titleVisibility = .hidden
-            window.titlebarAppearsTransparent = true
-            window.standardWindowButton(.closeButton)?.isHidden = true
-            window.standardWindowButton(.miniaturizeButton)?.isHidden = true
-            window.standardWindowButton(.zoomButton)?.isHidden = true
             window.identifier = NSUserInterfaceItemIdentifier("keybridge-main")
-            window.minSize = NSSize(width: 760, height: 560)
+            window.minSize = frame.size
             window.isReleasedWhenClosed = false
-            window.contentViewController = KeyBridgeWindowController(model: .shared)
+            window.contentViewController = KeyBridgeWindowController(model: .shared, contentSize: window.contentLayoutRect.size)
             window.center()
             mainWindow = window
         }
+        if mainWindow?.isMiniaturized == true { mainWindow?.deminiaturize(nil) }
         mainWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }

@@ -73,7 +73,6 @@ final class AppModel: ObservableObject {
         guard !terminating, let action = request["action"] as? String,
               let id = request["id"] as? String, !id.isEmpty, id.utf8.count <= 128 else { return }
         switch action {
-        case "hide": NSApp.keyWindow?.orderOut(nil)
         case "open-url":
             if let text = request["value"] as? String, let url = URL(string: text) { openExternal(url) }
         case "installer", "driver": chooseFile(kind: action, id: id)

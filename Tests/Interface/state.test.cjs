@@ -101,8 +101,8 @@ test('A stale monitor failure is removed even from the manual-help return route'
  ui.state.navigation.push({kind:'help',view:{help:'monitor-error',diagnosing:false,detailTrail:[]}});ui.state.help='manual';ui.update({state:{phase:'waiting',key:false,contextVersion:'B'}});
  assert.equal(ui.state.help,'manual');assert.equal(ui.state.navigation.at(-1).view.help,'');assert.equal(ui.result('monitor'),'');
 });
-test('Hiding a window and opening an approved URL require no result bookkeeping',()=>{
- const ui=setup();assert.ok(ui.request('hide'));assert.ok(ui.request('open-url','https://releases.1c.ru/project/Platform85'));assert.equal(ui.pending.size,0);
+test('Window controls belong to macOS; opening an approved URL requires no result bookkeeping',()=>{
+ const ui=setup();assert.equal(ui.request('hide'),null);assert.ok(ui.request('open-url','https://releases.1c.ru/project/Platform85'));assert.equal(ui.pending.size,0);
 });
 test('Stop cancels an in-flight UI preference without inventing a saved value',()=>{
  const ui=setup(),a=ui.request('autostart',true);ui.request('stop');assert.equal(ui.autoWorking,false);assert.equal(ui.state.pendingAuto,null);assert.equal(ui.state.auto,false);complete(ui,a,true);assert.equal(ui.autoSaved,false);

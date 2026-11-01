@@ -188,10 +188,11 @@ def bundle_runtime(resources: Path, source_qemu: Path, source_img: Path, entitle
     return inventory
 
 
-def validate_brand_png(data: bytes) -> None:
-    """The only binary UI resource: a bounded, structurally valid brand image."""
-    if len(data) > 1024 * 1024 or data[:8] != b"\x89PNG\r\n\x1a\n":
-        raise RuntimeError("Invalid brand PNG")
+def validate_png(data: bytes, *, dimensions: tuple[int, int] | None = None,
+                 maximum: int = 1024 * 1024) -> None:
+    """Validate the two explicitly named image sources before bundling."""
+    if len(data) > maximum or data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise RuntimeError("Invalid PNG")
     offset, chunks, image_data = 8, [], False
     while offset + 12 <= len(data):
         length = struct.unpack_from(">I", data, offset)[0]
@@ -207,7 +208,9 @@ def validate_brand_png(data: bytes) -> None:
                 raise RuntimeError("Missing brand PNG header")
             width, height, depth, color, compression, filtering, interlace = struct.unpack(">IIBBBBB", payload)
             depths = {0: {1, 2, 4, 8, 16}, 2: {8, 16}, 3: {1, 2, 4, 8}, 4: {8, 16}, 6: {8, 16}}
-            if ((width, height) != (1240, 220) or depth not in depths.get(color, set())
+            valid_size = ((width, height) == dimensions if dimensions is not None
+                          else width == height and 1024 <= width <= 4096)
+            if (not valid_size or depth not in depths.get(color, set())
                     or compression != 0 or filtering != 0 or interlace not in (0, 1)):
                 raise RuntimeError("Unexpected brand PNG header")
         elif kind == b"IHDR":
@@ -221,6 +224,26 @@ def validate_brand_png(data: bytes) -> None:
                 raise RuntimeError("Invalid brand PNG ending")
             return
     raise RuntimeError("Incomplete brand PNG")
+
+
+def validate_brand_png(data: bytes) -> None:
+    validate_png(data, dimensions=(1240, 220))
+
+
+def bundle_app_icon(resources: Path) -> None:
+    source = ROOT / "Resources/app-icon.png"
+    if source.is_symlink():
+        raise RuntimeError("Application icon must not be a symlink")
+    validate_png(source.read_bytes(), maximum=8 * 1024 * 1024)
+    with tempfile.TemporaryDirectory(prefix="keybridge-icon-", dir=resources.parent) as folder:
+        iconset = Path(folder) / "AppIcon.iconset"
+        iconset.mkdir()
+        for size in (16, 32, 128, 256, 512):
+            for scale in (1, 2):
+                suffix = "@2x" if scale == 2 else ""
+                run("/usr/bin/sips", "-z", str(size * scale), str(size * scale), source,
+                    "--out", iconset / f"icon_{size}x{size}{suffix}.png", capture=True)
+        run("/usr/bin/iconutil", "-c", "icns", iconset, "-o", resources / "AppIcon.icns")
 
 
 def bundle_source_resources(resources: Path) -> None:
@@ -285,7 +308,7 @@ def main() -> None:
         raise RuntimeError("Build output must remain outside the source directory")
     destination.parent.mkdir(parents=True, exist_ok=True)
     WORK.mkdir(parents=True, exist_ok=True)
-    source_paths = ([ROOT / "Package.swift"] + sorted((ROOT / "Sources").rglob("*.swift"))
+    source_paths = ([ROOT / "Package.swift", ROOT / "Resources/app-icon.png"] + sorted((ROOT / "Sources").rglob("*.swift"))
                     + sorted((ROOT / "Resources/guest").glob("*.*"))
                     + sorted((ROOT / "Resources/interface").rglob("*.*")))
     source_hashes = {str(path.relative_to(ROOT)): sha256(path) for path in source_paths if path.is_file()}
@@ -315,6 +338,7 @@ def main() -> None:
     entitlements.write_bytes(plistlib.dumps({"com.apple.security.cs.allow-jit": True, "com.apple.security.cs.disable-library-validation": True}))
     info = {"CFBundleIdentifier": "pro.keybridge.pilot", "CFBundleName": "KeyBridge",
             "CFBundleDisplayName": "KeyBridge", "CFBundleExecutable": "KeyBridgeApp",
+            "CFBundleIconFile": "AppIcon.icns",
             "CFBundlePackageType": "APPL", "CFBundleShortVersionString": args.version,
             "CFBundleVersion": args.build_number, "LSMinimumSystemVersion": "27.0",
             "LSUIElement": False, "NSHighResolutionCapable": True,
@@ -333,6 +357,7 @@ def main() -> None:
     inventory = bundle_runtime(resources, Path("/opt/homebrew/bin/qemu-system-x86_64"),
                                Path("/opt/homebrew/bin/qemu-img"), entitlements, args.sign_identity)
     bundle_source_resources(resources)
+    bundle_app_icon(resources)
     shutil.copytree(base_folder, resources/"base")
     if not args.runtime_only:
         for name in PRODUCTS:

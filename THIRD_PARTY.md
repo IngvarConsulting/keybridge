@@ -5,7 +5,7 @@ The application source is MIT licensed. That license covers our own code only.
 The first public release is an **ad-hoc signed preview**, not notarized by Apple.
 This signing limitation is disclosed in the installation instructions and is
 separate from the licenses of redistributed components. The build copies only the application's Swift
-executables, its text resources and the named developer logo, selected QEMU binaries/firmware and their
+executables, its text resources, application icon and the named developer logo, selected QEMU binaries/firmware and their
 recursively discovered native dependencies. User installers and VM data remain
 outside the source tree and application bundle.
 

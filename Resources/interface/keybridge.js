@@ -7,7 +7,7 @@ const initial = {phase:'loading',tab:'main',prepared:false,client:'unknown',clie
 const localKeys=new Set(['tab','help','setupStep','diagnosing','detailTrail','navigation','installationOpen','editing','replacing','reviewSettings','dismissedError','pendingAuto']);
 const domainKeys=Object.keys(initial).filter(k=>!localKeys.has(k));
 const scopes={'check-key':'key','check-space':'space','check-permission':'permission','check-client':'client',recheck:'safety',stop:'stop',quit:'stop',prepare:'install',monitor:'monitor',configure:'config',repair:'config',restore:'config',rollback:'config',measure:'resources'};
-const commands=new Set(['installer','driver','cancel-installer','cancel-driver','prepare','start','stop','quit','configure','repair','restore','rollback','probe','monitor','check-key','check-client','check-space','recheck','check-permission','measure','autostart','open-url','hide']);
+const commands=new Set(['installer','driver','cancel-installer','cancel-driver','prepare','start','stop','quit','configure','repair','restore','rollback','probe','monitor','check-key','check-client','check-space','recheck','check-permission','measure','autostart','open-url']);
 const emptyFile=()=>({name:'',valid:false,checking:false,error:'',message:'',validation:''});
 function installerRecovery(issue){
  const causes={'missing-license-manager':'Выбранный установщик 1С не содержит нужный менеджер лицензий.','ambiguous-license-manager':'Установщик добавил несколько менеджеров лицензий. KeyBridge не может выбрать нужный.'};
@@ -26,12 +26,12 @@ class BridgeState {
   if(!this.state.autoAvailable&&((action==='autostart'&&value===true)||action==='check-permission'))return null;
   if(action==='cancel-installer'||action==='cancel-driver'){const kind=action.slice(7);for(const [id,request] of this.pending)if(request.action===kind)this.pending.delete(id);}
   const duplicate=[...this.pending.values()].find(p=>p.action===action);
-  if(duplicate&&action!=='open-url'&&action!=='hide')return null;
+  if(duplicate&&action!=='open-url')return null;
   if(action==='stop'||action==='quit'){this.epoch++;this.pending.clear();this.autoWorking=false;this.state.pendingAuto=null;this.autoError='';this.clearResults();}
   else if(['prepare','start','configure','repair','restore','rollback','probe'].includes(action))this.clearResults();
   const id=(global.crypto?.randomUUID?.()||('ui-'+Date.now().toString(36)+'-'+(++this.sequence))) ;
   const req={id,action,...(value===undefined?{}:{value})};
-  if(!['hide','open-url'].includes(action))this.pending.set(id,{...req,epoch:this.epoch,context:this.state.contextVersion,signature:this.signature(scopes[action])});
+  if(action!=='open-url')this.pending.set(id,{...req,epoch:this.epoch,context:this.state.contextVersion,signature:this.signature(scopes[action])});
   if(scopes[action])this.record(scopes[action],action==='stop'||action==='quit'?'Сохраняем выключение…':action==='monitor'?'Открываем монитор…':'Проверяем…');
   if(action==='autostart'){this.state.pendingAuto=!!value;this.autoWorking=true;this.autoSaved=false;this.autoError='';}
   return req;
