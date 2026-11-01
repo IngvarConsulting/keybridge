@@ -269,7 +269,8 @@ def main() -> None:
     source = auditor.export_source(output / (stem + "-source.zip"))
     for kind, path in (("runtime", args.runtime_sources), ("guest", args.guest_sources)):
         shutil.copyfile(path, output / (stem + "-" + kind + "-sources.zip"))
-    (output / "Установка.txt").write_text(instructions(args.version))
+    # GitHub normalizes non-ASCII asset filenames; keep published names stable.
+    (output / "INSTALL.txt").write_text(instructions(args.version))
     report = {"version": args.version, "source_revision": revision,
               "application": audit, "corresponding_sources": coverage,
               "source": {k: source[k] for k in ("file_count", "bytes", "sha256")},
