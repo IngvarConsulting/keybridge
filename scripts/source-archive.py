@@ -150,7 +150,7 @@ def approved_category(name: str) -> str | None:
     if name.startswith("Contents/Resources/base/"):
         relative = name[len("Contents/Resources/base/"):]
         if relative in BASE_IMAGES: return "linux-image"
-        if relative in BASE_TEXT or (relative.startswith("notices/") and Path(relative).name in {"copyright", "debian-packages.txt"}): return "linux-base-text"
+        if relative in BASE_TEXT or (relative.startswith("notices/") and Path(relative).name in {"copyright", "debian-packages.txt", "debian-source-packages.txt"}): return "linux-base-text"
     if name in ROOT_BUNDLE_FILES:
         return "metadata"
     p = Path(name)

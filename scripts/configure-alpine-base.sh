@@ -41,7 +41,7 @@ mkinitfs -F 'base ext4 ata scsi usb virtio cdrom' "$kernel"
 cp /boot/vmlinuz-virt /base-export/vmlinuz-virt
 cp /boot/initramfs-virt /base-export/initramfs-virt
 apk info -vv > /base-export/alpine-packages.txt
-apk info -a > /base-export/alpine-package-details.txt
+cp /lib/apk/db/installed /base-export/alpine-package-details.txt
 rm -f /etc/ssh/ssh_host_* /etc/machine-id
 test ! -d /opt/1cv8
 test ! -e /usr/sbin/aksusbd_x86_64

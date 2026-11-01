@@ -4,7 +4,7 @@
 
 Downloads stay outside the checkout. Alpine APKBUILD files run only in a
 disposable Docker container, never in the host shell. No application or user
-VM is started. Missing versions or source checksums stop publication.
+VM is started. Missing versions or source checksums stop this optional download.
 """
 from __future__ import annotations
 

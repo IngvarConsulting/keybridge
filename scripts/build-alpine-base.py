@@ -25,7 +25,7 @@ def build():
     shutil.copy2(ROOT/'scripts/configure-alpine-base.sh', context/'configure.sh')
     dockerfile = '''FROM debian:12-slim AS glibc
 RUN apt-get update && apt-get install -y --no-install-recommends libfontconfig1 libfreetype6 libglib2.0-0 libgssapi-krb5-2 libstdc++6 libusb-1.0-0
-RUN mkdir -p /glibc/lib/x86_64-linux-gnu /glibc/lib64 /glibc/etc /notices/debian && find -L /usr/lib/x86_64-linux-gnu -maxdepth 1 -type f -name '*.so*' -exec cp -L {} /glibc/lib/x86_64-linux-gnu/ \\; && ln -s /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /glibc/lib64/ld-linux-x86-64.so.2 && ldconfig -r /glibc && dpkg-query -W > /notices/debian-packages.txt && find /usr/share/doc -name copyright -exec cp --parents {} /notices/debian/ \\;
+RUN mkdir -p /glibc/lib/x86_64-linux-gnu /glibc/lib64 /glibc/etc /notices/debian && find -L /usr/lib/x86_64-linux-gnu -maxdepth 1 -type f -name '*.so*' -exec cp -L {} /glibc/lib/x86_64-linux-gnu/ \\; && ln -s /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /glibc/lib64/ld-linux-x86-64.so.2 && ldconfig -r /glibc && dpkg-query -W > /notices/debian-packages.txt && dpkg-query -W -f='${binary:Package}\\t${Version}\\t${source:Package}\\t${source:Version}\\n' > /notices/debian-source-packages.txt && find /usr/share/doc -name copyright -exec cp --parents {} /notices/debian/ \\;
 FROM alpine:3.22
 RUN apk add --no-cache alpine-base openssh python3 linux-virt e2fsprogs sudo lsblk blkid findmnt dpkg util-linux
 COPY --from=glibc /glibc/ /

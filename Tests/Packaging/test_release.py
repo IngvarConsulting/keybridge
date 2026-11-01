@@ -1,73 +1,140 @@
 # SPDX-License-Identifier: MIT
+from contextlib import contextmanager, ExitStack, redirect_stdout
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
+import plistlib
+import shutil
+from types import SimpleNamespace
 import tempfile
 import unittest
-import zipfile
+from unittest.mock import Mock, patch
 
 spec = importlib.util.spec_from_file_location("release", Path(__file__).resolve().parents[2] / "scripts/package-release.py")
 release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
 
 
-class CorrespondingSourcesTests(unittest.TestCase):
-    def archive(self, folder, *, complete=True, version="1", linked=True, corrupt=False, extra=False):
-        data = b"upstream source fixture"
-        manifest = {"schema": 1, "kind": "runtime", "complete": complete,
-                    "packages": [{"name": "fixture", "version": version,
-                                  "source_files": ["source.tar"] if linked else []}],
-                    "files": [{"path": "source.tar", "bytes": len(data),
-                               "sha256": hashlib.sha256(data).hexdigest()}]}
-        path = Path(folder) / "sources.zip"
-        with zipfile.ZipFile(path, "w") as output:
-            output.writestr("manifest.json", json.dumps(manifest))
-            output.writestr("source.tar", b"different" if corrupt else data)
-            if extra:
-                output.writestr("unrecorded", b"not inspected")
-        return path
+class ReleasePackagingTests(unittest.TestCase):
+    @contextmanager
+    def package(self, *, dirty=False, changed_source=False, initial_audit=True,
+                installed_tree="same", stale=True):
+        """Run the packaging workflow with OS commands replaced, without a VM."""
+        with tempfile.TemporaryDirectory() as temporary, ExitStack() as stack:
+            folder = Path(temporary)
+            checkout = folder / "checkout"
+            checkout.mkdir()
+            (checkout / "source.swift").write_text("reviewed code")
+            expected = release.sha256(checkout / "source.swift")
+            if changed_source:
+                (checkout / "source.swift").write_text("unbuilt code")
+            app = folder / "KeyBridge.app"
+            resources = app / "Contents/Resources"
+            resources.mkdir(parents=True)
+            (app / "Contents/Info.plist").write_bytes(plistlib.dumps({
+                "CFBundleShortVersionString": "0.1.0", "LSMinimumSystemVersion": "27.0",
+                "KeyBridgeLoginLaunchSupported": False}))
+            (resources / "build-inventory.json").write_text(json.dumps({
+                "sources_sha256": {"source.swift": expected}}))
+            for name in ("LICENSE", "THIRD_PARTY.md"):
+                (checkout / name).write_text(name)
+                (resources / name).write_text(name)
+            output = folder / "release"
+            auditor = Mock()
+            auditor.audit_app.side_effect = [
+                {"passed": initial_audit, "tree_sha256": "same"},
+                {"passed": True, "tree_sha256": installed_tree}]
+            commands = []
+            content = None
 
-    def test_complete_matching_sources_are_accepted(self):
-        with tempfile.TemporaryDirectory() as folder:
-            result = release.validate_sources(self.archive(folder), "runtime", {("runtime", "fixture", "1")})
-            self.assertTrue(result["complete"])
+            def run(*args):
+                nonlocal content
+                commands.append(tuple(str(a) for a in args))
+                if args[0] == "/usr/bin/ditto":
+                    shutil.copytree(args[1], args[2])
+                elif args[:2] == ("/usr/bin/hdiutil", "create"):
+                    content = Path(args[args.index("-srcfolder") + 1])
+                    Path(args[-1]).write_bytes(b"fixture disk image")
+                elif args[:2] == ("/usr/bin/hdiutil", "attach"):
+                    mount = Path(args[args.index("-mountpoint") + 1])
+                    shutil.copytree(content / "KeyBridge.app", mount / "KeyBridge.app")
 
-    def test_missing_wrong_unlinked_or_corrupt_sources_block_release(self):
-        for options in ({"complete": False}, {"version": "2"}, {"linked": False},
-                        {"corrupt": True}, {"extra": True}):
-            with self.subTest(options=options), tempfile.TemporaryDirectory() as folder:
-                with self.assertRaises(ValueError):
-                    release.validate_sources(self.archive(folder, **options), "runtime", {("runtime", "fixture", "1")})
+            def write_catalog(app, revision, destination):
+                destination.write_text("# Component sources\nhttps://example.org/exact-source.tar.gz\n")
+                return {"file": destination.name, "sha256": release.sha256(destination), "packages": 1}
 
-    def test_same_packages_do_not_allow_sources_for_another_base(self):
-        with tempfile.TemporaryDirectory() as folder:
-            app = Path(folder) / "KeyBridge.app"
-            base = app / "Contents/Resources/base"
-            base.mkdir(parents=True)
-            (base / "manifest.json").write_text(json.dumps({"build_id": "current", "files": {"disk": "new"}}))
-            for name in ("alpine-packages.txt", "alpine-package-details.txt"):
-                (base / name).write_text("same package version")
-            path = Path(folder) / "guest.zip"
-            with zipfile.ZipFile(path, "w") as archive:
-                archive.writestr("manifest.json", json.dumps({"base_build_id": "current"}))
-                archive.writestr("metadata/base-manifest.json", json.dumps({"build_id": "current", "files": {"disk": "old"}}))
-            with self.assertRaisesRegex(ValueError, "inventory differs"):
-                release.validate_source_binding(path, "guest", app)
+            def git(args, **kwargs):
+                return (" M source.swift\n" if dirty else "") if args[1] == "status" else "a" * 40 + "\n"
 
-    def test_same_runtime_packages_do_not_allow_another_firmware(self):
-        with tempfile.TemporaryDirectory() as folder:
-            app = Path(folder) / "KeyBridge.app"
-            firmware = app / "Contents/Resources/runtime/share/qemu"
-            firmware.mkdir(parents=True)
-            (firmware / "bios.bin").write_bytes(b"new firmware")
-            path = Path(folder) / "runtime.zip"
-            with zipfile.ZipFile(path, "w") as archive:
-                archive.writestr("manifest.json", json.dumps({"files": [{"path": "qemu.tar"}],
-                    "firmware_evidence": {"bios.bin": {"binary_sha256": hashlib.sha256(b"old firmware").hexdigest(),
-                        "source_archive": "qemu.tar", "source_paths": ["firmware/source.c"]}}}))
-            with self.assertRaisesRegex(ValueError, "different binaries"):
-                release.validate_source_binding(path, "runtime", app)
+            stack.enter_context(patch.object(release, "ROOT", checkout))
+            stack.enter_context(patch.object(release, "load_auditor", return_value=auditor))
+            catalog = stack.enter_context(patch.object(release, "load_source_links",
+                return_value=SimpleNamespace(write_catalog=Mock(side_effect=write_catalog))))
+            stack.enter_context(patch.object(release, "run", side_effect=run))
+            boot = stack.enter_context(patch.object(release, "boot_open_base"))
+            stack.enter_context(patch.object(release.subprocess, "check_output", side_effect=git))
+            control = stack.enter_context(patch.object(release.subprocess, "run",
+                return_value=SimpleNamespace(stdout=json.dumps({"stale": stale}))))
+            stack.enter_context(patch("sys.argv", ["package-release.py", "--app", str(app),
+                "--version", "0.1.0-beta.2", "--output", str(output)]))
+            stack.enter_context(redirect_stdout(io.StringIO()))
+            yield SimpleNamespace(output=output, auditor=auditor, commands=commands,
+                                  boot=boot, control=control, catalog=catalog)
+
+    def test_release_needs_no_source_archives_and_keeps_installation_checks(self):
+        with self.package() as state:
+            release.main()
+            self.assertEqual({p.name for p in state.output.iterdir()}, {
+                "KeyBridge-0.1.0-beta.2-macOS-arm64.dmg", "COMPONENT-SOURCES.md",
+                "INSTALL.txt", "release-audit.json", "SHA256SUMS.txt"})
+            report = json.loads((state.output / "release-audit.json").read_text())
+            self.assertEqual(report["source_repository"],
+                "https://github.com/IngvarConsulting/keybridge/tree/" + "a" * 40)
+            self.assertEqual(report["component_sources"]["file"], "COMPONENT-SOURCES.md")
+            state.auditor.export_source.assert_not_called()
+            self.assertEqual(state.auditor.audit_app.call_count, 2)
+            self.assertTrue(any(c[:2] == ("/usr/bin/hdiutil", "verify") for c in state.commands))
+            self.assertTrue(any(c[:2] == ("/usr/bin/hdiutil", "detach") for c in state.commands))
+            state.boot.assert_called_once()
+            state.control.assert_called_once()
+            for line in (state.output / "SHA256SUMS.txt").read_text().splitlines():
+                checksum, filename = line.split("  ")
+                self.assertEqual(hashlib.sha256((state.output / filename).read_bytes()).hexdigest(), checksum)
+
+    def test_dirty_checkout_or_source_mismatch_still_blocks_packaging(self):
+        for options, error in (({"dirty": True}, "Commit the reviewed"),
+                               ({"changed_source": True}, "different source")):
+            with self.subTest(options=options), self.package(**options) as state:
+                with self.assertRaisesRegex(ValueError, error):
+                    release.main()
+                self.assertFalse(state.output.exists())
+                self.assertEqual(state.commands, [])
+                state.boot.assert_not_called()
+
+    def test_invalid_application_still_blocks_packaging(self):
+        with self.package(initial_audit=False) as state:
+            with self.assertRaisesRegex(ValueError, "Application audit failed"):
+                release.main()
+            self.assertFalse(state.output.exists())
+            self.assertEqual(state.commands, [])
+
+    def test_changed_installed_copy_detaches_image_and_blocks_release_report(self):
+        with self.package(installed_tree="different") as state:
+            with self.assertRaisesRegex(ValueError, "changed during DMG installation"):
+                release.main()
+            self.assertTrue(any(c[:2] == ("/usr/bin/hdiutil", "detach") for c in state.commands))
+            self.assertFalse((state.output / "release-audit.json").exists())
+            state.boot.assert_not_called()
+
+    def test_first_run_must_use_empty_runtime(self):
+        with self.package(stale=False) as state:
+            with self.assertRaisesRegex(ValueError, "did not use an empty runtime"):
+                release.main()
+            state.boot.assert_called_once()
+            self.assertTrue(any(c[:2] == ("/usr/bin/hdiutil", "detach") for c in state.commands))
+            self.assertFalse((state.output / "release-audit.json").exists())
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Package an audited macOS preview and its complete companion sources.
+"""Package an audited macOS preview with links to its source repository.
 
 This creates local artifacts only. It never publishes, changes Gatekeeper,
 registers login items, or starts the user's VM.
@@ -11,14 +11,12 @@ import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import plistlib
 import re
-import shutil
 import subprocess
 import tempfile
 import time
-import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -46,90 +44,11 @@ def load_auditor():
     return module
 
 
-def package_inventory(app: Path, kind: str) -> set[tuple[str, str, str]]:
-    resources = app / "Contents/Resources"
-    if kind == "runtime":
-        return {("runtime", p["name"], p["version"])
-                for p in json.loads((resources / "ThirdParty/packages.json").read_text())}
-    expected = set()
-    for line in (resources / "base/alpine-packages.txt").read_text().splitlines():
-        value = line.split(" - ", 1)[0]
-        match = re.fullmatch(r"(.+)-([0-9][^-]*-r[0-9]+)", value)
-        if not match:
-            raise ValueError("Unrecognized Alpine package: " + value)
-        expected.add(("alpine", match[1], match[2]))
-    for line in (resources / "base/notices/debian-packages.txt").read_text().splitlines():
-        name, version = line.split()
-        expected.add(("debian", name, version))
-    return expected
-
-
-def validate_sources(path: Path, kind: str, expected: set[tuple[str, str, str]]) -> dict:
-    """Check coverage, file integrity and package-to-source links independently."""
-    with zipfile.ZipFile(path) as archive:
-        names = archive.namelist()
-        if len(names) != len(set(names)):
-            raise ValueError("Duplicate source archive entries")
-        for name in names:
-            parts = PurePosixPath(name)
-            if parts.is_absolute() or ".." in parts.parts or "\\" in name:
-                raise ValueError("Unsafe source archive path")
-        manifest = json.loads(archive.read("manifest.json"))
-        if manifest.get("schema") != 1 or manifest.get("kind") != kind or manifest.get("complete") is not True:
-            raise ValueError("Incomplete corresponding sources: " + kind)
-        packages = manifest.get("packages", [])
-        actual = {(p.get("distribution", "runtime"), p["name"], p["version"]) for p in packages}
-        if actual != expected or len(packages) != len(actual):
-            raise ValueError("Corresponding-source coverage differs from the application: " + kind)
-        files = manifest.get("files", [])
-        file_names = {entry["path"] for entry in files}
-        present = {name for name in names if not name.endswith("/")}
-        if len(file_names) != len(files) or present != file_names | {"manifest.json"}:
-            raise ValueError("Unrecorded or missing source archive files")
-        for package in packages:
-            sources = package.get("source_files", [])
-            if not sources or not set(sources) <= file_names:
-                raise ValueError("Package has no delivered sources: " + package["name"])
-        for entry in files:
-            info = archive.getinfo(entry["path"])
-            if (info.external_attr >> 16) & 0o170000 == 0o120000:
-                raise ValueError("Source archive links are not accepted")
-            with archive.open(info) as stream:
-                checksum = stream_digest(stream)
-            if info.file_size != entry["bytes"] or checksum != entry["sha256"]:
-                raise ValueError("Corrupt corresponding source: " + entry["path"])
-    return {"kind": kind, "packages": len(packages), "files": len(files), "complete": True}
-
-
-def validate_source_binding(path: Path, kind: str, app: Path) -> None:
-    """Bind source provenance to this base image, firmware and installed recipes."""
-    resources = app / "Contents/Resources"
-    with zipfile.ZipFile(path) as archive:
-        manifest = json.loads(archive.read("manifest.json"))
-        if kind == "guest":
-            base = resources / "base"
-            built = json.loads((base / "manifest.json").read_text())
-            if manifest.get("base_build_id") != built["build_id"]:
-                raise ValueError("Guest sources belong to a different base build")
-            for name in ("manifest.json", "alpine-packages.txt", "alpine-package-details.txt"):
-                if archive.read("metadata/base-" + name) != (base / name).read_bytes():
-                    raise ValueError("Guest source inventory differs from the packaged base")
-        else:
-            firmware = resources / "runtime/share/qemu"
-            evidence = manifest.get("firmware_evidence", {})
-            if set(evidence) != {p.name for p in firmware.iterdir() if p.is_file()}:
-                raise ValueError("Firmware source coverage differs from the application")
-            delivered = {entry["path"] for entry in manifest["files"]}
-            for name, entry in evidence.items():
-                if (entry["binary_sha256"] != sha256(firmware / name)
-                        or entry.get("source_archive") not in delivered or not entry.get("source_paths")):
-                    raise ValueError("Firmware source evidence belongs to different binaries")
-            notices = resources / "ThirdParty"
-            for folder in notices.iterdir():
-                if folder.is_dir():
-                    for source in folder.iterdir():
-                        if archive.read("recipes/" + folder.name + "/" + source.name) != source.read_bytes():
-                            raise ValueError("Source recipe or receipt differs from the packaged runtime")
+def load_source_links():
+    spec = importlib.util.spec_from_file_location("keybridge_source_links", ROOT / "scripts/component-sources.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def instructions(version: str) -> str:
@@ -156,7 +75,10 @@ Homebrew, Docker и Python на вашем Mac не нужны.
 Автоматическая проверка пока не подтверждает, что именно её запуск 1С
 получил аппаратную лицензию. Проверяйте работу в своей базе 1С.
 
-Код, лицензии и соответствующие исходники внешних компонентов:
+Код и скрипты сборки опубликованы в репозитории KeyBridge:
+https://github.com/IngvarConsulting/keybridge/tree/v{version}
+Ссылки на исходники версий внешних компонентов — в COMPONENT-SOURCES.md
+на странице выпуска:
 https://github.com/IngvarConsulting/keybridge/releases/tag/v{version}
 
 Если заменяете прежнюю сборку, сначала выберите в ней «Выключить и выйти».
@@ -203,8 +125,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--app", type=Path, required=True)
     parser.add_argument("--version", required=True, help="Preview tag version, e.g. 0.1.0-beta.1")
-    parser.add_argument("--runtime-sources", type=Path, required=True)
-    parser.add_argument("--guest-sources", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+-beta\.[1-9][0-9]*", args.version):
@@ -232,11 +152,8 @@ def main() -> None:
     for name in ("LICENSE", "THIRD_PARTY.md"):
         if (ROOT / name).read_bytes() != (app / "Contents/Resources" / name).read_bytes():
             raise ValueError("Bundled notice differs from published source: " + name)
-    coverage = [validate_sources(args.runtime_sources, "runtime", package_inventory(app, "runtime")),
-                validate_sources(args.guest_sources, "guest", package_inventory(app, "guest"))]
-    validate_source_binding(args.runtime_sources, "runtime", app)
-    validate_source_binding(args.guest_sources, "guest", app)
     output.mkdir(parents=True)
+    sources = load_source_links().write_catalog(app, revision, output / "COMPONENT-SOURCES.md")
     stem = "KeyBridge-" + args.version
     dmg = output / (stem + "-macOS-arm64.dmg")
     with tempfile.TemporaryDirectory(prefix="keybridge-dmg-", dir=output.parent) as temporary:
@@ -269,14 +186,12 @@ def main() -> None:
                     raise ValueError("Isolated first-run check did not use an empty runtime")
         finally:
             run("/usr/bin/hdiutil", "detach", mount)
-    source = auditor.export_source(output / (stem + "-source.zip"))
-    for kind, path in (("runtime", args.runtime_sources), ("guest", args.guest_sources)):
-        shutil.copyfile(path, output / (stem + "-" + kind + "-sources.zip"))
     # GitHub normalizes non-ASCII asset filenames; keep published names stable.
     (output / "INSTALL.txt").write_text(instructions(args.version))
     report = {"version": args.version, "source_revision": revision,
-              "application": audit, "corresponding_sources": coverage,
-              "source": {k: source[k] for k in ("file_count", "bytes", "sha256")},
+              "application": audit,
+              "source_repository": "https://github.com/IngvarConsulting/keybridge/tree/" + revision,
+              "component_sources": sources,
               "dmg_verified": True, "installed_copy_verified": True,
               "isolated_control_launch": True, "open_guest_boot_128_mib": True,
               "hardware_license_tested": False, "signature": "ad-hoc", "notarized": False}

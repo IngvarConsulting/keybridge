@@ -179,7 +179,7 @@ itself is available at https://github.com/Homebrew/brew .
 KeyBridge does not modify QEMU or library implementation source. Its build-app.py
 copies selected executables and dylibs, rewrites Mach-O paths to @loader_path,
 and signs the results. That script and all application source are in the release's
-KeyBridge source attachment and the tagged public repository. Run that script to
+tagged public repository. Run that script to
 repeat the relocation after rebuilding dependencies.
 
 LGPL libraries remain separate dynamic libraries in Contents/Resources/runtime/lib.
