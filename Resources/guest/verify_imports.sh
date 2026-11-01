@@ -9,6 +9,17 @@ fail() {
   exit 1
 }
 
+if test "${1:-}" = --installed-manager; then
+  # Check the actual installation as well as the installer's advertised list.
+  # A fixture root allows this same check to run without a VM or installation.
+  manager_root=${2:-/opt/1cv8/x86_64}
+  set -- "$manager_root"/*/rmlic
+  test "$#" -eq 1 || fail ambiguous_license_manager
+  test -f "$1" && test -x "$1" || fail missing_license_manager
+  printf '%s\n' "$1"
+  exit 0
+fi
+
 package=$(dpkg-deb -f runtime.deb Package) || fail invalid_driver_package
 architecture=$(dpkg-deb -f runtime.deb Architecture) || fail invalid_driver_package
 version=$(dpkg-deb -f runtime.deb Version) || fail invalid_driver_package

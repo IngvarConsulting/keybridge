@@ -266,11 +266,106 @@ final class AppPresentationTests: XCTestCase {
         XCTAssertTrue(installer.contains("полную поставку для Linux x86-64"))
         XCTAssertTrue(installer.contains("выберите файл заново"))
         let manager = AppPresentation.failureMessage(action: "installer", raw: "lic_manager absent")
-        XCTAssertTrue(manager.contains("не найден менеджер лицензий"))
+        XCTAssertTrue(manager.contains("не содержит нужный менеджер лицензий"))
+        XCTAssertTrue(manager.contains("Выберите другой установщик"))
+        XCTAssertFalse(manager.contains("полную поставку"))
         let driver = AppPresentation.failureMessage(action: "driver", raw: "unreadable")
         XCTAssertTrue(driver.contains("aksusbd для Linux amd64"))
         XCTAssertFalse(driver.contains("10.33"))
         XCTAssertFalse(installer.contains("8.5.4.1878"))
+    }
+
+    func testConfirmedManagerCompositionFailureRequiresAnotherInstallerAndClearsAfterRefresh() {
+        for (raw, issue) in [
+            ("KEYBRIDGE_ERROR=missing_license_manager", "missing-license-manager"),
+            ("В установщике 1С отсутствует компонент lic_manager. Подробности в локальном журнале: /private/test", "missing-license-manager"),
+            ("KEYBRIDGE_ERROR=ambiguous_license_manager", "ambiguous-license-manager"),
+            ("После установки найдено несколько менеджеров лицензий", "ambiguous-license-manager")
+        ] {
+            var value = stopped
+            value["lastFailure"] = ["action": "prepare", "kind": "operation", "message": raw]
+            let projected = state(value)
+            XCTAssertEqual(projected["phase"] as? String, "install-error")
+            XCTAssertEqual(projected["installerIssue"] as? String, issue)
+            let message = projected["errorMessage"] as? String ?? ""
+            XCTAssertTrue(message.contains("Выберите другой установщик 1С"))
+            XCTAssertFalse(message.contains("полную поставку"))
+            XCTAssertFalse(message.contains("Повторите"))
+            XCTAssertFalse(message.contains("/private"))
+            value["lastFailure"] = NSNull()
+            XCTAssertEqual(state(value)["installerIssue"] as? String, "")
+        }
+    }
+
+    func testRuntimeErrorsAndCancellationDoNotInventMissingInstallerComponents() {
+        for action in ["prepare", "start", "probe"] {
+            XCTAssertEqual(AppPresentation.installerIssue(action: action, raw: "lic_manager failed to open port"), "")
+        }
+        XCTAssertEqual(AppPresentation.installerIssue(action: "start", raw: "missing_license_manager"), "")
+        var value = stopped
+        value["lastFailure"] = ["action": "prepare", "kind": "cancelled", "message": "missing_license_manager"]
+        XCTAssertEqual(state(value)["installerIssue"] as? String, "")
+    }
+
+    func testNewInstallerSelectionHidesOnlyItsHistoricalFailureWhileBackendStillReportsIt() throws {
+        for issue in ["missing_license_manager", "ambiguous_license_manager"] {
+            var observed = stopped
+            observed["prepared"] = false
+            observed["status"] = "error"
+            observed["lastError"] = issue
+            observed["lastOperation"] = "prepare"
+            observed["lastFailure"] = ["action": "prepare", "kind": "operation", "message": issue]
+            let progress = failedPreparation(id: "attempt-A")
+            let rejectedRevision = UUID(), replacementRevision = UUID()
+            let binding = try XCTUnwrap(InstallerFailureBinding(status: observed, preparation: progress,
+                                                               installerRevision: rejectedRevision))
+            func project(_ revision: UUID) -> [String: Any] {
+                AppPresentation.snapshot(status: observed, preparation: progress, installerRevision: revision,
+                                         rejectedInstaller: binding)["state"] as! [String: Any]
+            }
+            XCTAssertEqual(project(rejectedRevision)["phase"] as? String, "install-error")
+            // Choosing a driver changes no installer revision and must not hide it.
+            XCTAssertFalse((project(rejectedRevision)["installerIssue"] as? String ?? "").isEmpty)
+            for _ in 0..<2 { // A subsequent periodic snapshot must not revive the error.
+                let view = project(replacementRevision)
+                XCTAssertEqual(view["phase"] as? String, "first")
+                XCTAssertEqual(view["installerIssue"] as? String, "")
+                XCTAssertEqual(view["errorMessage"] as? String, "")
+            }
+            XCTAssertEqual((observed["lastFailure"] as? [String: String])?["message"], issue)
+            XCTAssertEqual(observed["lastError"] as? String, issue)
+            XCTAssertEqual(progress.state, "failed")
+            observed["lastError"] = "" // Ordinary status refreshes can clear this transient field.
+            XCTAssertEqual(project(replacementRevision)["installerIssue"] as? String, "")
+            XCTAssertEqual(project(replacementRevision)["phase"] as? String, "first")
+            observed["prepared"] = true
+            XCTAssertEqual(project(replacementRevision)["phase"] as? String, "stopped")
+        }
+    }
+
+    func testNewSelectionNeverSuppressesANewAttemptOrAnUnrelatedFailure() throws {
+        var observed = stopped
+        observed["lastFailure"] = ["action": "prepare", "kind": "operation", "message": "missing_license_manager"]
+        let progress = failedPreparation(id: "attempt-A")
+        let binding = try XCTUnwrap(InstallerFailureBinding(status: observed, preparation: progress, installerRevision: UUID()))
+        let newRevision = UUID()
+        let newAttempt = AppPresentation.snapshot(status: observed, preparation: failedPreparation(id: "attempt-B"),
+                                                 installerRevision: newRevision, rejectedInstaller: binding)["state"] as! [String: Any]
+        XCTAssertEqual(newAttempt["phase"] as? String, "install-error")
+        XCTAssertEqual(newAttempt["installerIssue"] as? String, "missing-license-manager")
+        for (action, message) in [("prepare", "ENOSPC"), ("configure", "permission denied")] {
+            observed["lastFailure"] = ["action": action, "kind": "operation", "message": message]
+            let view = AppPresentation.snapshot(status: observed, preparation: progress, installerRevision: newRevision,
+                                                rejectedInstaller: binding)["state"] as! [String: Any]
+            XCTAssertFalse((view["errorMessage"] as? String ?? "").isEmpty)
+            if action == "configure" { XCTAssertEqual(view["accessError"] as? String, "configuring") }
+            else { XCTAssertEqual(view["phase"] as? String, "install-error") }
+        }
+    }
+
+    private func failedPreparation(id: String) -> PreparationSnapshot {
+        PreparationSnapshot(id: id, state: "failed", phase: "verify_imports", startedAt: 1,
+                            phaseStartedAt: 1, updatedAt: 2, lastOutputAt: 2, finishedAt: 2, recoveryReason: nil)
     }
 
     func testLocalCheckFailuresExplainTheActualMissingDependency() {

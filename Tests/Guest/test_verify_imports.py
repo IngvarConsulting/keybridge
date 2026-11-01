@@ -67,6 +67,57 @@ case "$1" in --version) echo "$PLATFORM";; --help) printf ' --enable-components 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(reason, result.stdout)
 
+    def test_missing_advertised_manager_stops_after_help_without_installing(self):
+        result, calls = self.check(components='client_full server ru')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('KEYBRIDGE_ERROR=missing_license_manager', result.stdout)
+        self.assertNotIn('KEYBRIDGE_IMPORTS_VERIFIED', result.stdout)
+        self.assertEqual(calls, '--version\n--help\n')
+
+    def installed_manager(self, root):
+        return subprocess.run(['/bin/sh', str(SCRIPT), '--installed-manager', str(root)],
+                              text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=10)
+
+    def test_installed_manager_must_exist_and_be_an_executable_file(self):
+        # This is a synthetic installation result, not a vendor 8.5.1 installer.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'installation with spaces' / 'x86_64'
+            manager = root / 'any-version' / 'rmlic'
+            for layout in ('absent', 'not_executable', 'directory'):
+                with self.subTest(layout=layout):
+                    if layout == 'not_executable':
+                        manager.parent.mkdir(parents=True)
+                        manager.write_text('#!/bin/sh\nexit 0\n')
+                        manager.chmod(0o600)
+                    elif layout == 'directory':
+                        manager.unlink()
+                        manager.mkdir()
+                    result = self.installed_manager(root)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stdout, '')
+                    self.assertIn('KEYBRIDGE_ERROR=missing_license_manager', result.stderr)
+
+    def test_installed_manager_returns_one_executable_and_rejects_ambiguity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'x86_64'
+            first = root / 'any-version' / 'rmlic'
+            first.parent.mkdir(parents=True)
+            first.write_text('#!/bin/sh\nexit 0\n')
+            first.chmod(0o700)
+            result = self.installed_manager(root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), str(first))
+            second = root / 'another-version' / 'rmlic'
+            second.parent.mkdir()
+            second.write_bytes(first.read_bytes())
+            second.chmod(0o700)
+            result = self.installed_manager(root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, '')
+            self.assertIn('KEYBRIDGE_ERROR=ambiguous_license_manager', result.stderr)
+            self.assertNotIn('KEYBRIDGE_ERROR=missing_license_manager', result.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()

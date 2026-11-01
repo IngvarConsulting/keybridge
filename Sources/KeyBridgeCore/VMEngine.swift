@@ -271,6 +271,7 @@ public final class VMEngine {
                 "missing_driver_runtime":"В DEB-пакете отсутствуют программы aksusbd и hasplmd",
                 "invalid_platform_installer":"Не удалось прочитать сведения установщика 1С",
                 "missing_license_manager":"В установщике 1С отсутствует компонент lic_manager",
+                "ambiguous_license_manager":"После установки найдено несколько менеджеров лицензий",
                 "stage_dependencies":"Не удалось установить зависимости Linux",
                 "stage_driver":"Не удалось установить драйвер HASP",
                 "stage_firmware_guard":"Runtime не подтвердил запрет обновления прошивки ключа",

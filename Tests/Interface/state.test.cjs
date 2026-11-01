@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const {BridgeState} = require('../../Resources/interface/keybridge.js');
+const {BridgeState,installerRecovery} = require('../../Resources/interface/keybridge.js');
 const setup=()=>{const ui=new BridgeState();ui.update({state:{phase:'stopped',prepared:true,client:'managed',contextVersion:'A',auto:false,autoAvailable:true,hold:true}});return ui;};
 function complete(ui,request,ok,message='',state={}){return ui.update({state,feedback:{id:request.id,action:request.action,ok,message}});}
 test('A new window cannot claim work or license success before a native snapshot',()=>{
@@ -26,6 +26,22 @@ test('Replacing an invalid component preserves the other selected component',()=
  const ui=setup();ui.update({files:{installer:{name:'platform.run',valid:true,validation:'preliminary',message:'Состав проверим при установке.'},driver:{name:'arm64.deb',error:'Нужен amd64',valid:false}}});
  assert.equal(ui.state.installer,true);assert.equal(ui.state.driver,false);
  ui.update({files:{driver:{name:'driver.deb',valid:true}}});assert.equal(ui.state.driver,true);assert.equal(ui.files.installer.name,'platform.run');assert.equal(ui.files.installer.validation,'preliminary');
+});
+test('Confirmed manager composition failures offer replacement, not the same installation again',()=>{
+ for(const issue of ['missing-license-manager','ambiguous-license-manager']){
+  const ui=setup();ui.update({files:{installer:{name:'selected.run',valid:true},driver:{name:'selected.deb',valid:true}}});
+  const request=ui.request('prepare');assert.ok(request);
+  ui.update({state:{phase:'install-error',installerIssue:issue},files:{installer:{name:'selected.run',valid:false,error:'Choose another installer'}},feedback:{id:request.id,action:'prepare',ok:false,message:'Choose another installer'}});
+  const recovery=installerRecovery(ui.state.installerIssue);
+  assert.equal(recovery.action,'replace');assert.equal(recovery.label,'Выбрать другие файлы');
+  assert.doesNotMatch(recovery.remedy,/Повторите|полную поставку|8\.5/);
+  assert.equal(ui.request('prepare'),null);assert.equal(ui.state.installer,false);
+  assert.equal(ui.files.driver.name,'selected.deb');assert.equal(ui.state.driver,true);
+  ui.update({files:{installer:{name:'replacement.run',valid:true,validation:'preliminary'}}});
+  assert.equal(ui.state.installer,true);assert.ok(ui.request('prepare'));
+ }
+ assert.equal(installerRecovery('unknown-error'),null);
+ assert.notEqual(installerRecovery('missing-license-manager').cause,installerRecovery('ambiguous-license-manager').cause);
 });
 test('Requesting an action changes no factual state; completion must carry facts',()=>{
  const ui=setup(),request=ui.request('start');assert.equal(ui.state.phase,'stopped');assert.equal(ui.state.want,false);assert.equal(ui.pending.size,1);

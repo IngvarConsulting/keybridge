@@ -52,8 +52,8 @@ mkdir -p /opt/1cv8/common
 swapoff "$swap"
 rm "$swap"
 milestone manager_configure
-set -- /opt/1cv8/x86_64/*/rmlic
-test "$#" -eq 1 && test -x "$1"
+manager=$(sh ./verify_imports.sh --installed-manager)
+set -- "$manager"
 manager_dir=${1%/rmlic}
 ln -s "$1" /usr/local/lib/keybridge/rmlic
 for unexpected in 1cv8 ragent rphost; do test ! -e "$manager_dir/$unexpected"; done

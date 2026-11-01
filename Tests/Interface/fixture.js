@@ -1,7 +1,7 @@
 // Test-only native bridge. This file is never copied into the application bundle.
 'use strict';
 const fixture=document.querySelector('#fixture'),frame=document.querySelector('#application'),output=document.querySelector('#request');
-const empty={phase:'ready',prepared:true,client:'managed',clientRestored:false,key:true,want:true,hold:false,auto:false,autoAvailable:true,permission:'allowed',proof:'none',saved:true,selected:'current',step:0,updated:false,previousAvailable:false,updateProblem:false,previousValid:false,backupAvailable:false,pendingQuit:false,errorMessage:'',accessError:null,safetyBlock:null,contextVersion:'fixture-A',operationPending:false,fault:null};
+const empty={phase:'ready',prepared:true,client:'managed',clientRestored:false,key:true,want:true,hold:false,auto:false,autoAvailable:true,permission:'allowed',proof:'none',saved:true,selected:'current',step:0,updated:false,previousAvailable:false,updateProblem:false,previousValid:false,backupAvailable:false,pendingQuit:false,errorMessage:'',installerIssue:'',accessError:null,safetyBlock:null,contextVersion:'fixture-A',operationPending:false,fault:null};
 const scenes={
  autostart_unavailable:['Автозапуск недоступен в сборке',{phase:'stopped',want:false,autoAvailable:false,permission:'unsupported'}],
  ready:['Работает',{}],first:['Первый запуск',{phase:'first',prepared:false,client:'missing',key:false,want:false}],
@@ -11,6 +11,7 @@ const scenes={
  unconfirmed:['Проба неподтверждена',{proof:'unconfirmed'}],success:['Подтверждённая проба',{proof:'success'}],failure:['Ошибка пробы',{proof:'failure'}],probe_timeout:['Таймаут пробы',{proof:'timeout'}],stale:['Старая проба',{proof:'stale'}],probing:['Проверка выполняется',{phase:'probing'}],
  update_failed:['Проблема обновления',{phase:'update-error',updated:true,updateProblem:true,previousAvailable:true,want:false,hold:true}],
  preparing:['Установка',{phase:'preparing',step:1,prepared:false,want:false}],starting:['Включение',{phase:'starting'}],stopping:['Выключение',{phase:'stopping'}],recovering:['Восстановление',{phase:'recovering'}],exhausted:['Попытки закончились',{phase:'exhausted',hold:true,want:false}],
+ install_manager_missing:['В установщике нет менеджера',{phase:'install-error',prepared:false,want:false,installerIssue:'missing-license-manager'}],install_manager_ambiguous:['Несколько менеджеров в установщике',{phase:'install-error',prepared:false,want:false,installerIssue:'ambiguous-license-manager'}],
  install_failed:['Ошибка установки',{phase:'install-error',prepared:false,want:false}],start_failed:['Ошибка включения',{phase:'start-error',want:false}],
  unsafe:['Защита неизвестна',{phase:'unsafe',hold:true,safetyBlock:'unsafe'}],multiple:['Несколько ключей',{phase:'multiple',key:false,hold:true,safetyBlock:'multiple'}],unknown:['Состояние неизвестно',{phase:'unknown',safetyBlock:'unknown'}],
  unsaved:['Stop не сохранён',{phase:'stopped',want:false,saved:false}],stopped:['Выключен',{phase:'stopped',want:false,hold:true}],
@@ -26,7 +27,8 @@ const resourceRows=[['Память для работы с ключом','128 М�
 function snapshot(feedback){frame.contentWindow.KeyBridge.update({state,files,keyLabel:'Sentinel HL Pro',componentLabel:'1С 8.5.4.1878 · драйвер HASP 10.33',proofTime:'12:40',resourceRows,...(feedback?{feedback}:{})});}
 function select(){
  request=null;state={...empty,...scenes[fixture.value][1]};files={installer:{name:'',valid:false},driver:{name:'',valid:false}};
- if(fixture.value==='invalid_installer')files.installer={name:'client-only.run',valid:false,error:'В установщике нет менеджера лицензий. Выберите полную поставку 1С.'};
+ if(fixture.value==='invalid_installer')files.installer={name:'client-only.run',valid:false,error:'Выбранный установщик не содержит нужный менеджер лицензий. Выберите другой установщик 1С с этим компонентом.'};
+ if(state.installerIssue){files.installer={name:'selected-x86_64.run',valid:false,error:state.installerIssue==='missing-license-manager'?'Выбранный установщик не содержит нужный менеджер лицензий. Выберите другой установщик 1С с этим компонентом.':'Установщик добавил несколько менеджеров лицензий. Выберите другой установщик 1С с одним менеджером лицензий.'};files.driver={name:'aksusbd_selected_amd64.deb',valid:true,validation:'preliminary',message:'Формат подходит.'};}
  if(fixture.value==='invalid_driver'){files.installer={name:'setup-full-…-x86_64.run',valid:true,validation:'preliminary',message:'Формат подходит. Состав проверим при установке.'};files.driver={name:'aksusbd_arm64.deb',valid:false,error:'Архитектура arm64 не подходит. Выберите пакет amd64.'};}
  snapshot();frame.contentWindow.KeyBridge.navigate(['permission','permission_unknown','inhibited','autostart_unavailable'].includes(fixture.value)?'settings':['unconfirmed','success','failure','probe_timeout','stale','probing'].includes(fixture.value)?'diagnosis':'main');output.textContent='Запросов нет';
 }

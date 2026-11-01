@@ -1,10 +1,44 @@
 // SPDX-License-Identifier: MIT
 import Foundation
 
+/// Binds a composition failure to the selected installer and preparation that
+/// produced it. Historical agent observations stay intact after a new selection.
+public struct InstallerFailureBinding {
+    private let installerRevision: UUID?
+    private let preparationID: String?
+    private let signature: [String]
+
+    public init?(status: [String: Any], preparation: PreparationSnapshot?, installerRevision: UUID?) {
+        guard let signature = Self.signature(status) else { return nil }
+        self.signature = signature
+        self.preparationID = preparation?.id
+        self.installerRevision = installerRevision
+    }
+
+    public func matches(status: [String: Any], preparation: PreparationSnapshot?) -> Bool {
+        Self.signature(status) == signature && preparation?.id == preparationID
+    }
+
+    public func isHistorical(status: [String: Any], preparation: PreparationSnapshot?, selectedRevision: UUID?) -> Bool {
+        selectedRevision != nil && selectedRevision != installerRevision && matches(status: status, preparation: preparation)
+    }
+
+    private static func signature(_ status: [String: Any]) -> [String]? {
+        guard let failure = status["lastFailure"] as? [String: Any],
+              let action = failure["action"] as? String, let message = failure["message"] as? String,
+              failure["kind"] as? String == "operation",
+              !AppPresentation.installerIssue(action: action, raw: message).isEmpty else { return nil }
+        return [action, failure["kind"] as? String ?? "", message]
+    }
+}
+
 /// Presentation only: this projection neither starts work nor fills missing
 /// observations with a successful example from the interface prototype.
 public enum AppPresentation {
-    public static func snapshot(status: [String: Any], preparation: PreparationSnapshot? = nil) -> [String: Any] {
+    public static func snapshot(status: [String: Any], preparation: PreparationSnapshot? = nil,
+                                installerRevision: UUID? = nil, rejectedInstaller: InstallerFailureBinding? = nil) -> [String: Any] {
+        let historicalInstallerFailure = rejectedInstaller?.isHistorical(status: status, preparation: preparation,
+                                                                         selectedRevision: installerRevision) == true
         let prepared = bool(status, "prepared")
         let running = bool(status, "running")
         let stale = bool(status, "stale")
@@ -17,7 +51,7 @@ public enum AppPresentation {
         let previous = bool(status, "previousAvailable")
         let client = clientState(status)
         let connected = bool(status, "keyConnected")
-        let phase = phase(status, preparation: preparation)
+        let phase = phase(status, preparation: preparation, historicalInstallerFailure: historicalInstallerFailure)
         let proof = proof(status, phase: phase, client: client)
         let saved = status["stopSaved"] as? Bool
             ?? (string(status, "stopPersistenceError").isEmpty &&
@@ -42,11 +76,13 @@ public enum AppPresentation {
             "running": running && !stale, "stale": stale,
             "busy": bool(status, "busy"), "operation": operation,
             "safetyBlock": stale || ownership == "unknown" ? "unknown" : NSNull(),
-            "errorMessage": "", "accessError": NSNull()
+            "errorMessage": "", "installerIssue": "", "accessError": NSNull()
         ]
         // The raw diagnostic string is never placed in the product UI.
-        if !failureText.isEmpty, failureKind != "cancelled" {
-            state["errorMessage"] = failureMessage(action: failureAction.isEmpty ? operation : failureAction, raw: failureText)
+        if !failureText.isEmpty, failureKind != "cancelled", !historicalInstallerFailure {
+            let action = failureAction.isEmpty ? operation : failureAction
+            state["errorMessage"] = failureMessage(action: action, raw: failureText)
+            state["installerIssue"] = installerIssue(action: action, raw: failureText)
             if ["configure", "repair"].contains(failureAction), !bool(status, "busy") {
                 state["accessError"] = "configuring"
             }
@@ -63,6 +99,13 @@ public enum AppPresentation {
     /// Classifies a failed real operation without exposing paths, stderr or
     /// claiming a specific cause when the backend did not establish it.
     public static func failureMessage(action: String, raw: String) -> String {
+        switch installerIssue(action: action, raw: raw) {
+        case "missing-license-manager":
+            return "Выбранный установщик 1С не содержит нужный менеджер лицензий. Выберите другой установщик 1С для Linux x86-64 с этим компонентом."
+        case "ambiguous-license-manager":
+            return "Установщик добавил несколько менеджеров лицензий. KeyBridge не может выбрать нужный. Выберите другой установщик 1С для Linux x86-64 с одним менеджером лицензий."
+        default: break
+        }
         let text = raw.lowercased()
         if text.contains("no space") || text.contains("enospc") || text.contains("не хватает места") || text.contains("недостаточно места") {
             return "На Mac не хватает свободного места. Освободите место и повторите действие."
@@ -78,9 +121,6 @@ public enum AppPresentation {
         }
         if ["configure", "repair", "restore"].contains(action), text.contains("изменен") || text.contains("изменён") || text.contains("external") {
             return "Настройки 1С изменились после подключения KeyBridge. Вернитесь к настройке поиска лицензии и выберите «Исправить настройки»."
-        }
-        if ["prepare", "installer"].contains(action), text.contains("lic_manager") || text.contains("менеджер лицензий отсутств") {
-            return "В выбранном установщике не найден менеджер лицензий. Выберите полную поставку 1С для Linux x86-64."
         }
         if action == "driver", text.contains("другой пакет") || text.contains("package") && text.contains("aksusbd") {
             return "Выбран другой пакет. Скачайте драйвер aksusbd для Linux amd64 и выберите его файл DEB."
@@ -120,7 +160,22 @@ public enum AppPresentation {
         }
     }
 
-    private static func phase(_ status: [String: Any], preparation: PreparationSnapshot?) -> String {
+    /// Only an established package-composition failure requires a different
+    /// installer. Mentioning rmlic/lic_manager in a runtime error is not proof.
+    public static func installerIssue(action: String, raw: String) -> String {
+        guard ["prepare", "installer"].contains(action) else { return "" }
+        let text = raw.lowercased()
+        if text.contains("ambiguous_license_manager") || text.contains("найдено несколько менеджеров лицензий") {
+            return "ambiguous-license-manager"
+        }
+        if text.contains("missing_license_manager") || text.contains("отсутствует компонент lic_manager") ||
+            text.contains("lic_manager absent") || text.contains("менеджер лицензий отсутств") {
+            return "missing-license-manager"
+        }
+        return ""
+    }
+
+    private static func phase(_ status: [String: Any], preparation: PreparationSnapshot?, historicalInstallerFailure: Bool) -> String {
         guard !status.isEmpty else { return "loading" }
         if bool(status, "stale") { return "unknown" }
         let operation = string(status, "operation")
@@ -167,8 +222,10 @@ public enum AppPresentation {
         if ownership == "owned" { return "unknown" }
         if action == "rollback" && kind != "cancelled" { return "rollback-error" }
         if action == "restore" && kind != "cancelled" { return "restore-error" }
-        if action == "prepare" && kind != "cancelled" { return "install-error" }
-        if raw == "error" && preparation?.state == "failed" && !["start", "probe", "stop"].contains(string(status, "lastOperation")) { return "install-error" }
+        if !historicalInstallerFailure {
+            if action == "prepare" && kind != "cancelled" { return "install-error" }
+            if raw == "error" && preparation?.state == "failed" && !["start", "probe", "stop"].contains(string(status, "lastOperation")) { return "install-error" }
+        }
         if ["start", "reconcile", "health", "refresh-key"].contains(action), kind != "cancelled" {
             if integer(status["remainingAttempts"]) == 0 && bool(status, "autoInhibit") { return "exhausted" }
             return "start-error"

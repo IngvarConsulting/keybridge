@@ -19,7 +19,9 @@ def build():
     assert ROOT != BUILD and ROOT not in BUILD.parents
     context = BUILD/'alpine-base-context'
     context.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(ROOT/'Resources/guest', context/'helpers', dirs_exist_ok=True)
+    # Deleted helpers must not survive in a cached build context or its identity.
+    if (context/'helpers').exists(): shutil.rmtree(context/'helpers')
+    shutil.copytree(ROOT/'Resources/guest', context/'helpers')
     shutil.copy2(ROOT/'scripts/configure-alpine-base.sh', context/'configure.sh')
     dockerfile = '''FROM debian:12-slim AS glibc
 RUN apt-get update && apt-get install -y --no-install-recommends libfontconfig1 libfreetype6 libglib2.0-0 libgssapi-krb5-2 libstdc++6 libusb-1.0-0

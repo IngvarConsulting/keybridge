@@ -15,6 +15,7 @@ final class AppModel: ObservableObject {
     private var fileURLs: [String: URL] = [:]
     private var files: [String: [String: Any]] = [:]
     private var fileRevisions: [String: UUID] = [:]
+    private var rejectedInstaller: InstallerFailureBinding?
     private var preparation: PreparationSnapshot?
     private var feedback: [String: Any]?
     private var client: [String: Any] = [:]
@@ -23,6 +24,7 @@ final class AppModel: ObservableObject {
     private let submissions = ApplicationSubmissionQueue()
     private var failurePhase: String?
     private var failureMessage = ""
+    private var failureInstallerIssue = ""
     private var failureContext: String?
     private var updateProblem = false
     private var updateGeneration = ""
@@ -125,7 +127,7 @@ final class AppModel: ObservableObject {
         state = observation.0
         preparation = observation.1
         if let failureContext, failureContext != observationContext {
-            failurePhase = nil; failureMessage = ""; self.failureContext = nil
+            failurePhase = nil; failureMessage = ""; failureInstallerIssue = ""; self.failureContext = nil
         }
         loaded = true
         publish()
@@ -138,7 +140,8 @@ final class AppModel: ObservableObject {
         // read-only inspection supplies it without launching the licensing VM.
         for (key, value) in client { observed[key] = value }
         if flow.active == nil, let failurePhase { observed["uiFailurePhase"] = failurePhase }
-        var result = AppPresentation.snapshot(status: observed, preparation: preparation)
+        var result = AppPresentation.snapshot(status: observed, preparation: preparation,
+                                             installerRevision: fileRevisions["installer"], rejectedInstaller: rejectedInstaller)
         var view = result["state"] as? [String: Any] ?? [:]
         view["fault"] = NSNull()
         if !loaded { view["phase"] = "loading" }
@@ -150,6 +153,7 @@ final class AppModel: ObservableObject {
         } else if let failurePhase {
             if !["unknown", "unsafe", "multiple", "paused"].contains(view["phase"] as? String ?? "") { view["phase"] = failurePhase }
             view["errorMessage"] = failureMessage
+            view["installerIssue"] = failureInstallerIssue
             if failurePhase == "first" { view["fault"] = "space" }
         }
         let generation = state["generation"] as? String ?? ""
@@ -193,10 +197,21 @@ final class AppModel: ObservableObject {
                 self.publish(); return
             }
             let revision = UUID()
+            if kind == "installer" {
+                if self.rejectedInstaller?.matches(status: self.state, preparation: self.preparation) != true {
+                    self.rejectedInstaller = InstallerFailureBinding(status: self.state, preparation: self.preparation,
+                                                                      installerRevision: self.fileRevisions["installer"])
+                }
+                if !self.failureInstallerIssue.isEmpty {
+                    self.failurePhase = nil
+                    self.failureMessage = ""
+                    self.failureInstallerIssue = ""
+                    self.failureContext = nil
+                }
+            }
             self.fileRevisions[kind] = revision
             self.fileURLs[kind] = url
             self.files[kind] = ["name": url.lastPathComponent, "valid": false, "checking": true]
-            self.failurePhase = nil
             self.publish()
             Task {
                 do {
@@ -241,7 +256,9 @@ final class AppModel: ObservableObject {
         operation?.cancel()
         failurePhase = nil
         failureMessage = ""
+        failureInstallerIssue = ""
         failureContext = nil
+        if action == "prepare" { rejectedInstaller = nil }
         feedback = nil
         if ["start", "stop", "prepare", "rollback", "configure", "repair", "restore"].contains(action) { contextEpoch &+= 1 }
         var arguments = [mapping[action] ?? action]
@@ -308,6 +325,15 @@ final class AppModel: ObservableObject {
                 guard flow.isCurrent(ticket), !Task.isCancelled else { return }
                 message = AppPresentation.failureMessage(action: action, raw: error.localizedDescription)
                 failureMessage = message
+                failureInstallerIssue = AppPresentation.installerIssue(action: action, raw: error.localizedDescription)
+                if !failureInstallerIssue.isEmpty {
+                    rejectedInstaller = InstallerFailureBinding(status: state, preparation: preparation,
+                                                                installerRevision: fileRevisions["installer"])
+                    // The host format check was preliminary. Keep the driver,
+                    // but stop offering the rejected installer for another run.
+                    files["installer"] = ["name": fileURLs["installer"]?.lastPathComponent ?? "",
+                                          "valid": false, "checking": false, "error": message]
+                }
                 failureContext = observationContext
                 switch action {
                 case "prepare": failurePhase = message.localizedCaseInsensitiveContains("мест") ? "first" : "install-error"
