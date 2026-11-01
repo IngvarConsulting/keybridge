@@ -20,6 +20,9 @@ if test "${1:-}" = --installed-manager; then
   exit 0
 fi
 
+case "${1:-}" in ""|--installer-only) ;; *) fail invalid_validation_mode ;; esac
+
+if test "${1:-}" != --installer-only; then
 package=$(dpkg-deb -f runtime.deb Package) || fail invalid_driver_package
 architecture=$(dpkg-deb -f runtime.deb Architecture) || fail invalid_driver_package
 version=$(dpkg-deb -f runtime.deb Version) || fail invalid_driver_package
@@ -28,9 +31,10 @@ test "$architecture" = amd64 || fail wrong_driver_architecture
 test -n "$version" || fail invalid_driver_package
 # Read the complete archive so a truncated data member cannot pass on metadata alone.
 contents=$(dpkg-deb --contents runtime.deb) || fail invalid_driver_package
-for binary in aksusbd hasplmd; do
+for binary in aksusbd_x86_64 hasplmd_x86_64; do
   printf '%s\n' "$contents" | grep -Eq "[[:space:]][.]/usr/sbin/$binary$" || fail missing_driver_runtime
 done
+fi
 
 version=$(timeout 300 ./setup.run --version --installer-language en) || fail invalid_platform_installer
 printf '%s\n' "$version" | grep -Eq '^1C:Enterprise[[:space:]]' || fail invalid_platform_installer

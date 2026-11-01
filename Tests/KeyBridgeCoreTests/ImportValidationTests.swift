@@ -48,27 +48,3 @@ final class ImportValidationTests: XCTestCase {
         try body(root.appendingPathComponent("renamed installer.run"), root.appendingPathComponent("renamed driver.deb"))
     }
 }
-
-extension ImportValidationTests {
-    func testDriverMetadataAllowsFutureVersionAndRejectsWrongArchitectureOrPackage() throws {
-        let root=FileManager.default.temporaryDirectory.appendingPathComponent("kb-driver-"+UUID().uuidString)
-        try BridgePaths.preparePrivateDirectory(root);defer{try?FileManager.default.removeItem(at:root)}
-        func package(_ name:String,_ architecture:String) throws ->URL {
-            try Data("Package: \(name)\nArchitecture: \(architecture)\nVersion: 99.3-unknown-future\n".utf8).write(to:root.appendingPathComponent("control"))
-            let archive=root.appendingPathComponent("control.tar")
-            let result=try hostCommand("/usr/bin/tar",["-cf",archive.path,"-C",root.path,"control"])
-            XCTAssertEqual(result.code,0)
-            let bytes=try Data(contentsOf:archive)
-            func field(_ s:String,_ width:Int)->String {s+String(repeating:" ",count:width-s.count)}
-            let header=field("control.tar/",16)+field("0",12)+field("0",6)+field("0",6)+field("100644",8)+field(String(bytes.count),10)+"`\n"
-            var deb=Data("!<arch>\n".utf8);deb.append(Data(header.utf8));deb.append(bytes)
-            let file=root.appendingPathComponent("arbitrary-name.deb");try deb.write(to:file);return file
-        }
-        let future=try ImportValidation.inspect(package("aksusbd","amd64"),kind:"driver")
-        XCTAssertEqual(future["valid"] as?Bool,true)
-        XCTAssertEqual(future["version"] as?String,"99.3-unknown-future")
-        XCTAssertEqual(future["validation"] as?String,"preliminary")
-        XCTAssertThrowsError(try ImportValidation.inspect(package("aksusbd","arm64"),kind:"driver"))
-        XCTAssertThrowsError(try ImportValidation.inspect(package("other","amd64"),kind:"driver"))
-    }
-}

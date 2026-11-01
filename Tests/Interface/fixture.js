@@ -28,8 +28,8 @@ function snapshot(feedback){frame.contentWindow.KeyBridge.update({state,files,ke
 function select(){
  request=null;state={...empty,...scenes[fixture.value][1]};files={installer:{name:'',valid:false},driver:{name:'',valid:false}};
  if(fixture.value==='invalid_installer')files.installer={name:'client-only.run',valid:false,error:'Выбранный установщик не содержит нужный менеджер лицензий. Выберите другой установщик 1С с этим компонентом.'};
- if(state.installerIssue){files.installer={name:'selected-x86_64.run',valid:false,error:state.installerIssue==='missing-license-manager'?'Выбранный установщик не содержит нужный менеджер лицензий. Выберите другой установщик 1С с этим компонентом.':'Установщик добавил несколько менеджеров лицензий. Выберите другой установщик 1С с одним менеджером лицензий.'};files.driver={name:'aksusbd_selected_amd64.deb',valid:true,validation:'preliminary',message:'Формат подходит.'};}
- if(fixture.value==='invalid_driver'){files.installer={name:'setup-full-…-x86_64.run',valid:true,validation:'preliminary',message:'Формат подходит. Состав проверим при установке.'};files.driver={name:'aksusbd_arm64.deb',valid:false,error:'Архитектура arm64 не подходит. Выберите пакет amd64.'};}
+ if(state.installerIssue){files.installer={name:'selected-x86_64.run',valid:false,error:state.installerIssue==='missing-license-manager'?'Выбранный установщик не содержит нужный менеджер лицензий. Выберите другой установщик 1С с этим компонентом.':'Установщик добавил несколько менеджеров лицензий. Выберите другой установщик 1С с одним менеджером лицензий.'};files.driver={name:'aksusbd_selected_amd64.deb',valid:true,validation:'complete',message:'Формат подходит.'};}
+ if(fixture.value==='invalid_driver'){files.installer={name:'setup-full-…-x86_64.run',valid:true,validation:'preflight',message:'Менеджер лицензий заявлен в составе установщика.'};files.driver={name:'aksusbd_arm64.deb',valid:false,error:'Архитектура arm64 не подходит. Выберите пакет amd64.'};}
  snapshot();frame.contentWindow.KeyBridge.navigate(['permission','permission_unknown','inhibited','autostart_unavailable'].includes(fixture.value)?'settings':['unconfirmed','success','failure','probe_timeout','stale','probing'].includes(fixture.value)?'diagnosis':'main');output.textContent='Запросов нет';
 }
 frame.addEventListener('load',()=>{frame.contentWindow.webkit={messageHandlers:{keybridge:{postMessage(value){request=value;output.textContent=value.action;}}}};select();});
@@ -46,7 +46,7 @@ function complete(ok){
   if(current.action==='check-permission')state.permission='allowed';
   if(current.action==='check-client')state.client='unconfigured';
   if(current.action==='check-key'){state.key=true;state.phase='ready';}
-  if(['installer','driver'].includes(current.action))files[current.action]={name:current.action==='installer'?'setup-full-selected-x86_64.run':'aksusbd_selected_amd64.deb',valid:true,validation:current.action==='installer'?'preliminary':'complete',message:current.action==='installer'?'Формат подходит. Состав проверим при установке.':'Файл выбран и проверен'};
+  if(['installer','driver'].includes(current.action))files[current.action]={name:current.action==='installer'?'setup-full-selected-x86_64.run':'aksusbd_selected_amd64.deb',valid:true,validation:current.action==='installer'?'preflight':'complete',message:current.action==='installer'?'Менеджер лицензий заявлен в составе установщика.':'Файл выбран и проверен'};
  }
  snapshot({id:current.id,action:current.action,ok,message:ok?'':'Запись не завершилась. Повторите действие или отмените изменение.'});output.textContent=(ok?'Успех: ':'Отказ: ')+current.action;
 }

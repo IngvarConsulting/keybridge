@@ -107,3 +107,14 @@ test('Hiding a window and opening an approved URL require no result bookkeeping'
 test('Stop cancels an in-flight UI preference without inventing a saved value',()=>{
  const ui=setup(),a=ui.request('autostart',true);ui.request('stop');assert.equal(ui.autoWorking,false);assert.equal(ui.state.pendingAuto,null);assert.equal(ui.state.auto,false);complete(ui,a,true);assert.equal(ui.autoSaved,false);
 });
+
+test('Cancelling one file check rejects its late feedback and preserves the other component',()=>{
+ const ui=setup();ui.update({files:{installer:{name:'server.zip',valid:false,checking:true},driver:{name:'HASP.tar.gz',valid:true,validation:'complete'}}});
+ const checking=ui.request('installer');const cancel=ui.request('cancel-installer');
+ assert.equal(ui.pending.has(checking.id),false);
+ complete(ui,cancel,true,'',{ });
+ ui.update({files:{installer:{name:'server.zip',valid:false,checking:false,message:'Проверка отменена.'}}});
+ assert.equal(complete(ui,checking,true,'Checked'),null);
+ assert.equal(ui.files.installer.valid,false);assert.equal(ui.files.driver.valid,true);
+ assert.equal(ui.files.driver.name,'HASP.tar.gz');
+});

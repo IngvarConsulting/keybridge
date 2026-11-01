@@ -31,7 +31,25 @@ do {
     umask(0o077)
     if action == "inspect-import" {
         guard let kind=option("--kind"),let path=option("--path") else {throw BridgeError("Укажите тип и путь установщика.")}
-        var result=try ImportValidation.inspect(URL(fileURLWithPath:path),kind:kind);result["ok"]=true
+        func inspectSelection() throws -> [String:Any] {
+            let directory=FileManager.default.temporaryDirectory.appendingPathComponent("keybridge-inspection-"+UUID().uuidString)
+            try BridgePaths.preparePrivateDirectory(directory)
+            defer { try? FileManager.default.removeItem(at:directory) }
+            let parent=getppid()
+            let cancelled={ getppid() != parent }
+            let candidates=try ImportArchive.resolve(URL(fileURLWithPath:path),kind:kind,directory:directory.appendingPathComponent("files"),cancelled:cancelled)
+            let index=option("--candidate").flatMap(Int.init)
+            if candidates.count>1 && index == nil {
+                return ["ok":true,"valid":false,"candidates":candidates.map(\.displayName),"message":"В архиве несколько подходящих файлов. Выберите нужный компонент."]
+            }
+            guard let candidate=(index ?? 0)<candidates.count && (index ?? 0)>=0 ? candidates[index ?? 0] : nil else {throw BridgeError("Выбранный компонент не найден в архиве.")}
+            var result=try ImportInspection.inspect(candidate,kind:kind,resources:BridgePaths.resources,workspace:directory.appendingPathComponent("preflight"),cancelled:cancelled)
+            result.removeValue(forKey:"resolvedPath")
+            result["sourceName"]=URL(fileURLWithPath:path).lastPathComponent
+            result["ok"]=true
+            return result
+        }
+        let result=try inspectSelection()
         print(jsonText(result));exit(0)
     }
     if action == "client-status" {

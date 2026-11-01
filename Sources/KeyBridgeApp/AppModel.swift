@@ -15,6 +15,8 @@ final class AppModel: ObservableObject {
     private var fileURLs: [String: URL] = [:]
     private var files: [String: [String: Any]] = [:]
     private var fileRevisions: [String: UUID] = [:]
+    private var importTasks: [UUID: Task<Void, Never>] = [:]
+    private var importDirectories: [String: URL] = [:]
     private var rejectedInstaller: InstallerFailureBinding?
     private var preparation: PreparationSnapshot?
     private var feedback: [String: Any]?
@@ -33,6 +35,7 @@ final class AppModel: ObservableObject {
     private var reloadSequence: UInt64 = 0
     private var appliedSequence: UInt64 = 0
     private var loaded = false
+    private var terminating = false
     private var publishedData: Data?
     let runtime = BridgePaths.runtime
 
@@ -67,13 +70,18 @@ final class AppModel: ObservableObject {
     }
 
     func receive(_ request: [String: Any]) {
-        guard let action = request["action"] as? String,
+        guard !terminating, let action = request["action"] as? String,
               let id = request["id"] as? String, !id.isEmpty, id.utf8.count <= 128 else { return }
         switch action {
         case "hide": NSApp.keyWindow?.orderOut(nil)
         case "open-url":
             if let text = request["value"] as? String, let url = URL(string: text) { openExternal(url) }
         case "installer", "driver": chooseFile(kind: action, id: id)
+        case "cancel-installer", "cancel-driver":
+            let kind = action == "cancel-installer" ? "installer" : "driver"
+            cancelImport(kind: kind)
+            feedback = ["id": id, "action": action, "ok": true, "message": ""]
+            publish()
         case "quit": requestQuit(id: id)
         default: command(action, id: id, value: request["value"])
         }
@@ -182,59 +190,151 @@ final class AppModel: ObservableObject {
     }
 
     private func chooseFile(kind: String, id: String) {
-        guard !busy, !running else { return }
+        guard !terminating, !busy, !running else { return }
         let panel = NSOpenPanel()
         panel.title = kind == "driver" ? "Выберите драйвер USB-ключа" : "Выберите установщик 1С"
-        panel.message = kind == "driver" ? "Нужен пакет aksusbd для Linux amd64 (.deb)." : "Нужна полная поставка 1С для Linux x86-64 (.run), включающая менеджер лицензий."
+        panel.message = kind == "driver" ? "Выберите пакет aksusbd для Linux amd64 (.deb) или скачанный архив. KeyBridge найдёт и проверит драйвер." : "Выберите полную поставку 1С для Linux x86-64 (.run) или скачанный архив. KeyBridge проверит наличие менеджера лицензий."
         panel.prompt = "Выбрать"
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
-        panel.allowedContentTypes = [UTType(filenameExtension: kind == "driver" ? "deb" : "run") ?? .data]
+        panel.allowedContentTypes = ([kind == "driver" ? "deb" : "run"] + ["zip", "tar", "gz", "tgz", "xz", "txz", "bz2", "tbz2"]).compactMap { UTType(filenameExtension: $0) }
+        panel.allowsOtherFileTypes = true
         panel.begin { [weak self] response in
             guard let self else { return }
             guard response == .OK, let url = panel.url else {
                 self.feedback = ["id": id, "action": kind, "ok": false, "cancelled": true, "message": ""]
                 self.publish(); return
             }
-            let revision = UUID()
-            if kind == "installer" {
-                if self.rejectedInstaller?.matches(status: self.state, preparation: self.preparation) != true {
-                    self.rejectedInstaller = InstallerFailureBinding(status: self.state, preparation: self.preparation,
-                                                                      installerRevision: self.fileRevisions["installer"])
-                }
-                if !self.failureInstallerIssue.isEmpty {
-                    self.failurePhase = nil
-                    self.failureMessage = ""
-                    self.failureInstallerIssue = ""
-                    self.failureContext = nil
-                }
+            guard !self.terminating, !self.busy, !self.running else {
+                self.feedback = ["id": id, "action": kind, "ok": false, "message": "Дождитесь завершения действия и выберите файл снова."]
+                self.publish(); return
             }
-            self.fileRevisions[kind] = revision
-            self.fileURLs[kind] = url
-            self.files[kind] = ["name": url.lastPathComponent, "valid": false, "checking": true]
-            self.publish()
-            Task {
-                do {
-                    let inspected = try await Self.execute(["inspect-import", "--kind", kind, "--path", url.path])
-                    guard self.fileRevisions[kind] == revision else { return }
-                    var file = inspected
-                    file["name"] = url.lastPathComponent
-                    file["checking"] = false
-                    file["valid"] = inspected["valid"] as? Bool ?? inspected["ok"] as? Bool ?? true
-                    self.files[kind] = file
-                    self.feedback = ["id": id, "action": kind, "ok": file["valid"] as? Bool == true, "message": inspected["message"] ?? ""]
-                } catch {
-                    guard self.fileRevisions[kind] == revision else { return }
-                    let message = AppPresentation.failureMessage(action: kind, raw: error.localizedDescription)
-                    self.files[kind] = ["name": url.lastPathComponent, "valid": false, "checking": false, "error": message]
-                    self.feedback = ["id": id, "action": kind, "ok": false, "message": message]
-                }
-                self.publish()
-            }
+            self.inspectFile(url, kind: kind, id: id)
         }
     }
 
+    private func inspectFile(_ url: URL, kind: String, id: String) {
+        let previous = fileRevisions[kind].flatMap { importTasks[$0] }
+        previous?.cancel()
+        if let directory = importDirectories.removeValue(forKey: kind) { try? FileManager.default.removeItem(at: directory) }
+        let revision = UUID()
+        if kind == "installer" {
+            if rejectedInstaller?.matches(status: state, preparation: preparation) != true {
+                rejectedInstaller = InstallerFailureBinding(status: state, preparation: preparation,
+                                                            installerRevision: fileRevisions["installer"])
+            }
+            if !failureInstallerIssue.isEmpty {
+                failurePhase = nil; failureMessage = ""; failureInstallerIssue = ""; failureContext = nil
+            }
+        }
+        fileRevisions[kind] = revision
+        fileURLs.removeValue(forKey: kind)
+        files[kind] = ["name": url.lastPathComponent, "valid": false, "checking": true, "message": "Читаем файл или архив…"]
+        publish()
+        let resources = BridgePaths.resources
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("keybridge-selection-" + revision.uuidString)
+        importTasks[revision] = Task {
+            var retained = false
+            defer {
+                importTasks.removeValue(forKey: revision)
+                if !retained { try? FileManager.default.removeItem(at: directory) }
+            }
+            do {
+                await previous?.value
+                try Task.checkCancellation()
+                let candidates = try await Self.importWork {
+                    try ImportArchive.resolve(url, kind: kind, directory: directory.appendingPathComponent("files"), cancelled: { Task.isCancelled })
+                }
+                try Task.checkCancellation()
+                guard fileRevisions[kind] == revision else { return }
+                let candidate = try await selectCandidate(candidates, kind: kind)
+                try Task.checkCancellation()
+                files[kind]?["message"] = kind == "installer" ? "Проверяем наличие менеджера лицензий…" : "Проверяем программы драйвера…"
+                publish()
+                let inspected = try await Self.importWork {
+                    try ImportInspection.inspect(candidate, kind: kind, resources: resources,
+                                                 workspace: directory.appendingPathComponent("preflight"), cancelled: { Task.isCancelled })
+                }
+                try Task.checkCancellation()
+                guard fileRevisions[kind] == revision, inspected["valid"] as? Bool == true else { return }
+                var file = inspected
+                file["name"] = candidate.displayName
+                file["sourceName"] = url.lastPathComponent
+                file["checking"] = false
+                files[kind] = file
+                fileURLs[kind] = candidate.file
+                importDirectories[kind] = directory
+                retained = true
+                feedback = ["id": id, "action": kind, "ok": true, "message": inspected["message"] ?? ""]
+            } catch {
+                guard fileRevisions[kind] == revision else { return }
+                let cancelled = Task.isCancelled || error is CancellationError
+                let message: String
+                if cancelled { message = "Проверка отменена. Выберите файл заново." }
+                else if error is BridgeError || error is VMEngineError { message = error.localizedDescription }
+                else { message = "Не удалось прочитать файл. Проверьте доступ к нему или скачайте его заново и повторите выбор." }
+                files[kind] = ["name": url.lastPathComponent, "valid": false, "checking": false, "error": message]
+                feedback = ["id": id, "action": kind, "ok": false, "cancelled": cancelled, "message": message]
+            }
+            publish()
+        }
+    }
+
+    /// Cancelling the parent task also cancels the worker and waits for its
+    /// process cleanup. A replaced selection can never publish its old result.
+    nonisolated private static func importWork<T>(_ body: @escaping @Sendable () throws -> T) async throws -> T {
+        let worker = Task.detached(priority: .userInitiated) { try Task.checkCancellation(); return try body() }
+        return try await withTaskCancellationHandler(operation: { try await worker.value }, onCancel: { worker.cancel() })
+    }
+
+    private func selectCandidate(_ candidates: [ImportCandidate], kind: String) async throws -> ImportCandidate {
+        guard !candidates.isEmpty else { throw BridgeError("В архиве нет подходящего компонента. Выберите другой файл.") }
+        if candidates.count == 1 { return candidates[0] }
+        try Task.checkCancellation()
+        guard let window = NSApp.keyWindow ?? NSApp.mainWindow else { throw BridgeError("Откройте окно KeyBridge и выберите архив снова: в нём несколько подходящих файлов.") }
+        let alert = NSAlert()
+        alert.messageText = kind == "installer" ? "В архиве несколько установщиков 1С" : "В архиве несколько драйверов HASP"
+        alert.informativeText = "Выберите нужный файл. После выбора KeyBridge проверит его перед установкой."
+        alert.addButton(withTitle: "Выбрать"); alert.addButton(withTitle: "Отмена")
+        let choice = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 520, height: 28), pullsDown: false)
+        choice.addItems(withTitles: candidates.map(\.displayName)); alert.accessoryView = choice
+        let response = await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { continuation in
+                alert.beginSheetModal(for: window) { response in continuation.resume(returning: response) }
+            }
+        }, onCancel: {
+            Task { @MainActor in if let parent = alert.window.sheetParent { parent.endSheet(alert.window, returnCode: .cancel) } }
+        })
+        try Task.checkCancellation()
+        guard response == .alertFirstButtonReturn else { throw CancellationError() }
+        return candidates[choice.indexOfSelectedItem]
+    }
+
+    private func cancelImport(kind: String) {
+        guard let revision = fileRevisions[kind], let task = importTasks[revision] else { return }
+        task.cancel()
+        fileRevisions[kind] = UUID()
+        fileURLs.removeValue(forKey: kind)
+        files[kind]?["checking"] = false; files[kind]?["valid"] = false
+        files[kind]?["message"] = "Проверка отменена. Выберите файл заново."
+    }
+
+    func beginTermination() {
+        terminating = true
+        importTasks.values.forEach { $0.cancel() }
+    }
+
+    func finishImports() async {
+        let tasks = Array(importTasks.values)
+        tasks.forEach { $0.cancel() }
+        for task in tasks { await task.value }
+        for directory in importDirectories.values { try? FileManager.default.removeItem(at: directory) }
+        importDirectories.removeAll()
+    }
+
     func requestQuit(id: String = UUID().uuidString) {
+        guard !terminating else { return }
+        for kind in ["installer", "driver"] { cancelImport(kind: kind) }
         flow.requestQuit()
         AppDelegate.shared?.showWindow()
         if flow.active?.action == "stop" { publish(); return }
@@ -242,6 +342,7 @@ final class AppModel: ObservableObject {
     }
 
     func command(_ action: String, id: String = UUID().uuidString, value: Any? = nil) {
+        guard !terminating else { return }
         let mapping = ["check-key": "refresh-key", "recheck": "refresh-state", "check-permission": "refresh-state", "measure": "resources"]
         let allowed = ["prepare", "start", "stop", "probe", "configure", "repair", "restore", "rollback", "monitor", "autostart", "check-key", "check-client", "check-space", "recheck", "check-permission", "measure"]
         guard allowed.contains(action) else { return }
@@ -329,9 +430,10 @@ final class AppModel: ObservableObject {
                 if !failureInstallerIssue.isEmpty {
                     rejectedInstaller = InstallerFailureBinding(status: state, preparation: preparation,
                                                                 installerRevision: fileRevisions["installer"])
-                    // The host format check was preliminary. Keep the driver,
-                    // but stop offering the rejected installer for another run.
-                    files["installer"] = ["name": fileURLs["installer"]?.lastPathComponent ?? "",
+                    // The installer advertised a manager, but its actual installation failed
+                    // validation. Preserve the source label and the valid driver.
+                    files["installer"] = ["name": files["installer"]?["name"] as? String ?? "",
+                                          "sourceName": files["installer"]?["sourceName"] as? String ?? "",
                                           "valid": false, "checking": false, "error": message]
                 }
                 failureContext = observationContext

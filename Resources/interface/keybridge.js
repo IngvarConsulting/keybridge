@@ -7,7 +7,7 @@ const initial = {phase:'loading',tab:'main',prepared:false,client:'unknown',clie
 const localKeys=new Set(['tab','help','setupStep','diagnosing','detailTrail','navigation','installationOpen','editing','replacing','reviewSettings','dismissedError','pendingAuto']);
 const domainKeys=Object.keys(initial).filter(k=>!localKeys.has(k));
 const scopes={'check-key':'key','check-space':'space','check-permission':'permission','check-client':'client',recheck:'safety',stop:'stop',quit:'stop',prepare:'install',monitor:'monitor',configure:'config',repair:'config',restore:'config',rollback:'config',measure:'resources'};
-const commands=new Set(['installer','driver','prepare','start','stop','quit','configure','repair','restore','rollback','probe','monitor','check-key','check-client','check-space','recheck','check-permission','measure','autostart','open-url','hide']);
+const commands=new Set(['installer','driver','cancel-installer','cancel-driver','prepare','start','stop','quit','configure','repair','restore','rollback','probe','monitor','check-key','check-client','check-space','recheck','check-permission','measure','autostart','open-url','hide']);
 const emptyFile=()=>({name:'',valid:false,checking:false,error:'',message:'',validation:''});
 function installerRecovery(issue){
  const causes={'missing-license-manager':'Выбранный установщик 1С не содержит нужный менеджер лицензий.','ambiguous-license-manager':'Установщик добавил несколько менеджеров лицензий. KeyBridge не может выбрать нужный.'};
@@ -24,6 +24,7 @@ class BridgeState {
   if(!commands.has(action))return null;
   if(action==='prepare'&&installerRecovery(this.state.installerIssue)&&!this.files.installer.valid)return null;
   if(!this.state.autoAvailable&&((action==='autostart'&&value===true)||action==='check-permission'))return null;
+  if(action==='cancel-installer'||action==='cancel-driver'){const kind=action.slice(7);for(const [id,request] of this.pending)if(request.action===kind)this.pending.delete(id);}
   const duplicate=[...this.pending.values()].find(p=>p.action===action);
   if(duplicate&&action!=='open-url'&&action!=='hide')return null;
   if(action==='stop'||action==='quit'){this.epoch++;this.pending.clear();this.autoWorking=false;this.state.pendingAuto=null;this.autoError='';this.clearResults();}
@@ -123,9 +124,9 @@ function fileChoice(kind){
  const installer=kind==='installer',file=model.files[kind],selected=!!file.valid,invalid=!!file.error,name=installer?'Установщик 1С':'Драйвер HASP';
  const example=installer?'setup-full-…-x86_64.run':'aksusbd_…_amd64.deb';
  const source=installer?'1С':'Thales',url=installer?'https://releases.1c.ru/project/Platform85':'https://supportportal.thalesgroup.com/csm?_runtime_packages=&amp;id=kb_search&amp;query=kbcat_drivers_%26_runtime_packages&amp;u_products_available_in_portal_search=50303b92db852e00d298728dae96199d';
- const instruction=installer?'Потребуется учётная запись 1С. Скачайте полную поставку для Linux x86-64 с менеджером лицензий — файл .run. Версия может отличаться; KeyBridge проверит состав файла.':'Выберите Sentinel LDK Run-time для Linux: Debian/Ubuntu, 64-bit Intel (amd64), пакет DEB. Если скачался архив, распакуйте его и найдите файл aksusbd_…_amd64.deb. Версия может отличаться.';
- const pick=button((file.name?'Заменить ':'Выбрать ')+(installer?'установщик…':'драйвер…'),kind,false,file.checking||pendingAction(kind),(file.name?'Заменить ':'Выбрать ')+(installer?'установщик 1С':'драйвер HASP')).replace('<button',`<button id="kb-pick-${kind}"`);
- const status=file.checking?'Проверяем файл…':file.error||file.message||(selected?'Файл выбран':'Файл ещё не выбран');
+ const instruction=installer?'Потребуется учётная запись 1С. Скачайте полную поставку для Linux x86-64: файл .run или архив ZIP / tar.gz. Распаковывать не нужно — KeyBridge найдёт установщик и проверит наличие менеджера лицензий.':'Скачайте Sentinel LDK Run-time для Linux: пакет DEB для amd64 или архив ZIP / tar.gz. Распаковывать не нужно — KeyBridge найдёт драйвер и проверит его программы.';
+ const pick=(file.checking?button('Отменить проверку','cancel-'+kind):button((file.name?'Заменить ':'Выбрать ')+(installer?'установщик…':'драйвер…'),kind,false,pendingAction(kind),(file.name?'Заменить ':'Выбрать ')+(installer?'установщик 1С':'драйвер HASP'))).replace('<button',`<button id="kb-pick-${kind}"`);
+ const status=file.checking?(file.message||'Проверяем файл…'):file.error||file.message||(selected?'Файл выбран':'Файл ещё не выбран');
  return `<section class="kb-file-choice"><div class="kb-file-heading"><strong>${name}</strong><a class="kb-download" href="${url}">Скачать с сайта ${source} ↗</a></div><p class="kb-file-instruction">${instruction}</p><div class="kb-row kb-file-row"><div><small title="${e(file.name)}">${e(file.name||('Пример имени: '+example))}</small><small class="kb-file-status ${selected?'kb-green':''}" ${invalid?'role="alert"':''}>${e(status)}</small></div>${pick}</div></section>`;
 }
 function first(){
@@ -136,7 +137,7 @@ function first(){
  if(s.fault==='space')return issue('Установка не началась: не хватает места','На Mac недостаточно свободного места для установки выбранных программ.','Освободите место, затем нажмите «Проверить место». После проверки можно будет продолжить выбор файлов.',button('Как освободить место','storage-help')+button('Проверить место','check-space',true)+(s.replacing?button('Отмена','back',false,false,'Отменить переустановку'):''),'space');
  if(step==='installer')body+=`${fileChoice('installer')}<div class="kb-actions">${button('Продолжить','setup-next',true,!s.installer)}</div>`;
  else if(step==='driver')body+=`${fileChoice('driver')}<div class="kb-actions">${button('Продолжить','setup-next',true,!s.driver)}${button('Назад','setup-back')}</div>`;
- else body+=`${row('Установщик 1С',s.installer?(model.files.installer.validation==='preliminary'?'Формат подходит':'Проверен'):'Не проверен',model.files.installer.name)}${row('Драйвер HASP',s.driver?(model.files.driver.validation==='preliminary'?'Формат подходит':'Проверен'):'Не проверен',model.files.driver.name)}<div class="kb-actions">${button('Изменить файлы','edit-installer')}${button('Установить программы','prepare',true,busy()||!s.installer||!s.driver)}${button('Назад','setup-back')}</div><p class="kb-explain">На этом шаге KeyBridge ещё не использует USB-ключ.</p>`;
+ else body+=`${row('Установщик 1С',s.installer?(model.files.installer.validation==='preflight'?'Менеджер лицензий заявлен':'Проверен'):'Не проверен',model.files.installer.name)}${row('Драйвер HASP',s.driver?('Проверен'):'Не проверен',model.files.driver.name)}<div class="kb-actions">${button('Изменить файлы','edit-installer')}${button('Установить программы','prepare',true,busy()||!s.installer||!s.driver)}${button('Назад','setup-back')}</div><p class="kb-explain">На этом шаге KeyBridge ещё не использует USB-ключ.</p>`;
  if(s.replacing)body+=`<div class="kb-actions">${button('Отмена','back',false,false,'Отменить переустановку')}</div>`;
  return body;
 }
@@ -213,7 +214,7 @@ function settings(){
  else if(!s.autoAvailable)actions='';
  else if(s.auto&&s.hold)actions=button('Возобновить автозапуск','resume-auto',true)+(s.permission!=='allowed'?button('Как разрешить фоновую работу','permission'):'');
  else if(s.permission!=='allowed')actions=button('Как разрешить фоновую работу','permission',true)+button('Проверить разрешение','check-permission');
- return `<div class="kb-lead"><h2>Настройки</h2></div><div class="kb-row kb-auto-row"><label class="kb-check"><input type="checkbox" id="kb-auto" ${(s.pendingAuto??s.auto)?'checked':''} ${busy()||model.autoWorking||(!s.autoAvailable&&!s.auto)?'disabled':''}><span>Включать KeyBridge при входе в macOS<small>${autoExplanation()}</small></span></label><span class="kb-auto-feedback" data-saved="${model.autoSaved||s.pendingAuto!==null}">${model.autoWorking?'Сохраняем…':s.pendingAuto!==null?'Ошибка':'Сохранено'}</span></div>${permissionDetails()}<div class="kb-actions">${actions}</div>${s.client==='external'?clientConflict():''}${installation()}${company()}`;
+ return `<h2 class="kb-sr-only">Настройки</h2><div class="kb-row kb-auto-row"><label class="kb-check"><input type="checkbox" id="kb-auto" ${(s.pendingAuto??s.auto)?'checked':''} ${busy()||model.autoWorking||(!s.autoAvailable&&!s.auto)?'disabled':''}><span>Включать KeyBridge при входе в macOS<small>${autoExplanation()}</small></span></label><span class="kb-auto-feedback" data-saved="${model.autoSaved||s.pendingAuto!==null}">${model.autoWorking?'Сохраняем…':s.pendingAuto!==null?'Ошибка':'Сохранено'}</span></div>${permissionDetails()}<div class="kb-actions">${actions}</div>${s.client==='external'?clientConflict():''}${s.detailTrail.length?installation():''}${company()}`;
 }
 function focusKey(el){
  if(!el||!(content.contains(el)||panel.contains(el)))return null;
@@ -224,7 +225,7 @@ function focusKey(el){
 }
 function rememberFocus(el){rememberedFocus=focusKey(el);}
 function enterPage(kind,change){
- s.navigation=[...(s.navigation||[]),{kind,view:{help:s.help,diagnosing:s.diagnosing,detailTrail:[...(s.detailTrail||[])]},focus:rememberedFocus,scroll:content.scrollTop}];
+ s.navigation=[...(s.navigation||[]),{kind,view:{tab:s.tab,help:s.help,diagnosing:s.diagnosing,detailTrail:[...(s.detailTrail||[])]},focus:rememberedFocus,scroll:content.scrollTop}];
  change();render();
 }
 function returnPage(kind,fallback){
@@ -312,6 +313,14 @@ function chooseAuto(value){
 }
 function action(a){
  model.autoSaved=false;
+ if(a==='additional-actions'){
+  rememberedFocus={id:'kb-more-toggle'};
+  if(s.tab!=='settings'||s.help||s.detailTrail.length!==1||s.detailTrail[0]!=='0'){
+   enterPage('detail',()=>{s.tab='settings';s.help='';s.diagnosing=false;s.detailTrail=['0'];});
+  }
+  const heading=content.querySelector('h2');if(heading){heading.tabIndex=-1;heading.focus({preventScroll:true});}
+  return;
+ }
  if(a==='detail-back'){returnPage('detail',()=>{s.detailTrail=s.detailTrail.slice(0,-1);});return;}
  if(a==='diagnose'){enterPage('diagnosis',()=>{s.diagnosing=true;s.help='';});return;}
  if(a==='close-diagnosis'){returnPage('diagnosis',()=>{s.diagnosing=false;s.help='';});return;}
@@ -344,6 +353,7 @@ function action(a){
  render();
 }
 root.addEventListener('click',event=>{
+ if(!event.target.closest('.kb-more summary'))root.querySelector('.kb-more').open=false;
  const link=event.target.closest('a[href]');
  if(link){event.preventDefault();rememberFocus(link);send('open-url',link.href);return;}
  const button=event.target.closest('[data-action],[data-tab]');

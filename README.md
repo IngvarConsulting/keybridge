@@ -18,7 +18,9 @@ KeyBridge помогает установленной на Mac программ�
 
 Первый выпуск предварительный: подпись ad-hoc, без Developer ID и нотариализации Apple. Если macOS заблокирует открытие, разрешите запуск KeyBridge в **«Системные настройки» → «Конфиденциальность и безопасность»**. Этот способ описан в [инструкции Apple](https://support.apple.com/102445). На Mac с ограничениями организации может потребоваться помощь администратора. Запуск при входе в систему в этой сборке недоступен.
 
-В приложении выберите свои установщики 1С и HASP; ссылки на сайты производителей есть рядом с выбором файлов. Для работы готовой сборки Homebrew, Docker и Python не нужны. При обновлении сначала выберите «Выключить и выйти» в прежней версии. Пользовательские данные хранятся отдельно от приложения.
+В приложении выберите свои установщики 1С и HASP; ссылки на сайты производителей есть рядом с выбором файлов. Можно выбрать `.run`, `.deb` или скачанный ZIP/tar-архив: KeyBridge сам извлечёт нужный компонент, в том числе из вложенного архива. Сразу после выбора проверяются заявленный менеджер лицензий в установщике 1С и содержимое драйвера HASP. Если в архиве несколько подходящих файлов, приложение предложит выбрать один. Установка становится доступна после проверки обоих компонентов.
+
+Для работы готовой сборки Homebrew, Docker и Python не нужны. При обновлении сначала выберите «Выключить и выйти» в прежней версии. Пользовательские данные хранятся отдельно от приложения.
 
 ## Состояние проекта
 
@@ -55,7 +57,7 @@ python3 scripts/source-archive.py --source-only
 ```sh
 python3 scripts/collect-runtime-sources.py --app /path/to/KeyBridge.app --output /path/to/runtime-sources.zip
 python3 scripts/collect-guest-sources.py --app /path/to/KeyBridge.app --output /path/to/guest-sources.zip
-python3 scripts/package-release.py --app /path/to/KeyBridge.app --version 0.1.0-beta.1 \
+python3 scripts/package-release.py --app /path/to/KeyBridge.app --version 0.1.0-beta.2 \
   --runtime-sources /path/to/runtime-sources.zip --guest-sources /path/to/guest-sources.zip \
   --output /path/to/new-release-directory
 ```

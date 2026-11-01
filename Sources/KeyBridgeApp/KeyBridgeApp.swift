@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     static weak var shared: AppDelegate?
     private var mainWindow: NSWindow?
     private var mayTerminate = false
+    private var finishingQuit = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Self.shared = self
@@ -34,7 +35,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
-    func finishQuit() { mayTerminate = true; NSApp.terminate(nil) }
+    func finishQuit() {
+        guard !finishingQuit else { return }
+        finishingQuit = true
+        AppModel.shared.beginTermination()
+        Task {
+            await AppModel.shared.finishImports()
+            mayTerminate = true
+            NSApp.terminate(nil)
+        }
+    }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if mayTerminate { return .terminateNow }
