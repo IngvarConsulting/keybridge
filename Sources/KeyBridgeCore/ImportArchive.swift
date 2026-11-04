@@ -5,6 +5,21 @@ import Darwin
 public struct ImportCandidate: Sendable {
     public let file: URL
     public let displayName: String
+    let revision:FileRevision?
+    private let checkedKind:String?
+    private let inspection:Data?
+    init(file:URL,displayName:String,kind:String? = nil,result:[String:Any]? = nil,revision:FileRevision? = nil) throws {
+        self.file=file;self.displayName=displayName;self.checkedKind=kind;self.revision=revision
+        inspection=try result.map {try JSONSerialization.data(withJSONObject:$0)}
+    }
+    func requireUnchanged() throws {
+        if let revision,FileRevision(file) != revision { throw BridgeError("Проверенный файл изменился. Выберите установщик или драйвер заново.") }
+    }
+    func validation(kind:String)throws->[String:Any]? {
+        try requireUnchanged()
+        guard kind==checkedKind,let inspection else {return nil}
+        return try JSONSerialization.jsonObject(with:inspection) as? [String:Any]
+    }
 }
 
 /// Only generated names are written to disk. Archive paths are labels, never
@@ -19,8 +34,10 @@ public enum ImportArchive {
         var rejected = [String]()
         func accept(_ file: URL, label: String) throws {
             do {
-                _ = try ImportValidation.inspect(file, kind: kind, cancelled: cancelled)
-                candidates.append(ImportCandidate(file: file, displayName: label))
+                guard let before=FileRevision(file) else {throw BridgeError("Извлечённый файл недоступен")}
+                let result=try ImportValidation.inspect(file, kind: kind, cancelled: cancelled)
+                guard FileRevision(file)==before else {throw BridgeError("Файл изменился во время проверки. Выберите его заново.")}
+                candidates.append(try ImportCandidate(file:file,displayName:label,kind:kind,result:result,revision:before))
             } catch {
                 if cancelled() { throw VMEngineError.cancelled }
                 rejected.append(error.localizedDescription)

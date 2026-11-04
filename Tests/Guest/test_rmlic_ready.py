@@ -1,76 +1,56 @@
 # SPDX-License-Identifier: MIT
-"""Run the real POSIX helper with fake service/clock commands, never real systemd."""
-import json
-import os
+"""Read-only Alpine readiness against private proc fixtures, no actual services."""
+import importlib.util
 from pathlib import Path
-import subprocess
-import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
-SCRIPT = Path(__file__).resolve().parents[2] / 'Resources/guest/rmlic_ready.sh'
-FAKE_COMMAND = '''import json,os,pathlib,sys
-statepath=pathlib.Path(os.environ['FAKE_STATE'])
-state=json.loads(statepath.read_text())
-name=pathlib.Path(sys.argv[0]).name
-mode=state['mode']
-if name=='date':print(state['clock'])
-elif name=='sleep':state['clock']+=int(sys.argv[1])
-elif name=='ldd':print('libexample.so => not found' if mode=='missing' else 'libc.so.6 => /lib/libc.so.6')
-elif name=='journalctl':print('Synthetic private service diagnostic')
-elif name=='ss':
- if mode=='delayed' and state['clock']>=2:print('LISTEN 0 4096 0.0.0.0:1544 0.0.0.0:*')
-elif name=='systemctl':
- if '--value' not in sys.argv:print('ActiveState=failed' if mode=='failed' else 'ActiveState=active')
- else:
-  field=sys.argv[sys.argv.index('-p')+1]
-  values={'ActiveState':'failed' if mode=='failed' else 'active','NRestarts':'1' if mode=='failed' else '0','ExecMainStatus':'1' if mode=='failed' else '0','MainPID':'123'}
-  print(values[field])
-statepath.write_text(json.dumps(state))
-'''
+SCRIPT = Path(__file__).resolve().parents[2] / 'Resources/guest/alpine_ready.py'
+spec = importlib.util.spec_from_file_location('alpine_ready', SCRIPT)
+ready = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ready)
 
 
 class RmlicReadinessTests(unittest.TestCase):
-    def check(self, mode, timeout=5):
+    def observed(self, process='rmlic', inode='123', listening=True):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            state = root / 'state.json'
-            state.write_text(json.dumps({'mode': mode, 'clock': 0}))
-            for name in ('date', 'sleep', 'ldd', 'systemctl', 'journalctl', 'ss'):
-                command = root / name
-                command.write_text('#!' + sys.executable + '\n' + FAKE_COMMAND)
-                command.chmod(0o700)
-            env = dict(os.environ, PATH=str(root) + ':/usr/bin:/bin', FAKE_STATE=str(state))
-            result = subprocess.run(['/bin/sh', str(SCRIPT), str(timeout)], env=env, text=True,
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=10)
-            return result, json.loads(state.read_text())
+            root=Path(directory)
+            (root/'123/fd').mkdir(parents=True)
+            (root/'123/comm').write_text(process)
+            (root/'123/fd/3').symlink_to('socket:[123]')
+            (root/'net').mkdir()
+            state='0A' if listening else '01'
+            fields=['0:','00000000:0608','00000000:0000',state,'0','0','0','0','0',inode]
+            (root/'net/tcp').write_text('header\n'+' '.join(fields)+'\n')
+            (root/'net/tcp6').write_text('header\n')
+            with patch.object(ready,'Path',side_effect=lambda value: root/str(value).removeprefix('/proc/').removeprefix('/proc')):
+                return ready.manager_ready()
 
-    def test_service_active_before_listener_waits_until_tcp_ready(self):
-        result, state = self.check('delayed')
-        self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn('KEYBRIDGE_RMLIC_READY', result.stdout)
-        self.assertEqual(state['clock'], 2)
+    def testManagerOwnListeningSocketIsReady(self):
+        self.assertTrue(self.observed())
 
-    def test_missing_library_fails_before_poll_and_captures_diagnostics(self):
-        result, state = self.check('missing')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('KEYBRIDGE_ERROR=missing_dependencies', result.stdout)
-        self.assertIn('libexample.so => not found', result.stdout)
-        self.assertIn('Synthetic private service diagnostic', result.stdout)
-        self.assertEqual(state['clock'], 0)
+    def testUnrelatedProcessPortDoesNotProveManagerReadiness(self):
+        self.assertFalse(self.observed(process='unrelated'))
+        self.assertFalse(self.observed(inode='456'))
 
-    def test_service_crash_fails_without_waiting_full_deadline(self):
-        result, state = self.check('failed')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('KEYBRIDGE_ERROR=rmlic_failed', result.stdout)
-        self.assertIn('KEYBRIDGE_DIAGNOSTICS_END', result.stdout)
-        self.assertEqual(state['clock'], 0)
+    def testConnectedSocketIsNotAListener(self):
+        self.assertFalse(self.observed(listening=False))
 
-    def test_active_process_without_port_reaches_bounded_timeout(self):
-        result, state = self.check('timeout', timeout=3)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('KEYBRIDGE_ERROR=rmlic_timeout', result.stdout)
-        self.assertEqual(state['clock'], 3)
+    def testReadinessWaitsForObservedListener(self):
+        with patch.object(ready,'manager_ready',side_effect=[False,True]),patch.object(ready.time,'sleep') as sleep,patch('builtins.print'):
+            self.assertEqual(ready.main(['2']),0)
+        sleep.assert_called_once_with(0.25)
+
+    def testNoListenerHasFiniteDeadline(self):
+        with patch.object(ready,'manager_ready',return_value=False),patch.object(ready.time,'monotonic',side_effect=[0,1]),patch.object(ready.time,'sleep') as sleep,patch('builtins.print'):
+            self.assertEqual(ready.main(['1']),1)
+        sleep.assert_not_called()
+
+    def testInvalidTimeoutDoesNotObserveServices(self):
+        with patch.object(ready,'manager_ready') as observe,patch('builtins.print'):
+            self.assertEqual(ready.main(['unbounded']),2)
+        observe.assert_not_called()
 
 
 if __name__ == '__main__':

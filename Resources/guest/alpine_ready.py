@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Bounded Alpine readiness: live manager process and its TCP listener."""
+"""Read-only manager readiness; also used by the combined health observer."""
 import os
 from pathlib import Path
 import sys
 import time
 
-deadline = time.monotonic() + int(sys.argv[1] if len(sys.argv) > 1 else 90)
-while True:
+def manager_ready():
     processes = []
     for entry in Path('/proc').iterdir():
         if entry.name.isdigit():
@@ -34,10 +33,22 @@ while True:
             fields = line.split()
             if fields[1].endswith(':0608') and fields[3] == '0A' and fields[9] in sockets:
                 ready = True
-    if ready:
-        print('KEYBRIDGE_RMLIC_READY')
-        break
-    if time.monotonic() >= deadline:
-        print('KEYBRIDGE_ERROR=rmlic_timeout', file=sys.stderr)
-        sys.exit(1)
-    time.sleep(0.25)
+    return ready
+
+def main(argv=None):
+    arguments = sys.argv[1:] if argv is None else argv
+    if len(arguments) > 1 or (arguments and not arguments[0].isdigit()):
+        print('KEYBRIDGE_ERROR=invalid_readiness_timeout', file=sys.stderr)
+        return 2
+    deadline = time.monotonic() + int(arguments[0] if arguments else 90)
+    while not manager_ready():
+        if time.monotonic() >= deadline:
+            print('KEYBRIDGE_ERROR=rmlic_timeout', file=sys.stderr)
+            return 1
+        time.sleep(0.25)
+    print('KEYBRIDGE_RMLIC_READY')
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

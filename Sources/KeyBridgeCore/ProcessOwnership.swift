@@ -63,6 +63,7 @@ enum VMOwnership {
     case unknown(String)
     var identity: ProcessIdentity? { if case .owned(let id, _, _) = self { return id }; return nil }
     var isAbsent: Bool { if case .absent = self { return true }; return false }
+    var running: Any { switch self { case .absent: return false; case .owned: return true; case .unknown: return NSNull() } }
     var name: String { switch self { case .absent: return "absent"; case .owned: return "owned"; case .unknown: return "unknown" } }
 }
 
@@ -78,6 +79,53 @@ struct KernelProcessSummary {
 }
 
 struct HostProcessInspector {
+    /// VMEngine standardizes its runtime before constructing argv. Foundation
+    /// only resolves macOS aliases such as /private/tmp for existing paths, so
+    /// retain the normalized existing ancestor when runtime data was deleted.
+    static func canonicalPath(_ path: URL) -> URL {
+        var ancestor = path
+        var missing = [String]()
+        while !FileManager.default.fileExists(atPath: ancestor.path) {
+            let parent = ancestor.deletingLastPathComponent()
+            guard parent.path != ancestor.path else { break }
+            missing.append(ancestor.lastPathComponent)
+            ancestor = parent
+        }
+        return missing.reversed().reduce(ancestor.standardizedFileURL) { $0.appendingPathComponent($1) }
+    }
+
+    /// Shared by live enumeration and classification: normalizing only the
+    /// latter would discard the process before its identity could be checked.
+    static func matchesEndpoint(_ arguments: [String], runtime: URL) -> Bool {
+        let expected = canonicalPath(runtime).appendingPathComponent("qmp.sock")
+        let suffix = ",server=on,wait=off"
+        return arguments.indices.contains { index in
+            guard arguments[index] == "-qmp", index + 1 < arguments.count else { return false }
+            let endpoint = arguments[index + 1]
+            guard endpoint.hasPrefix("unix:"), endpoint.hasSuffix(suffix) else { return false }
+            let path = String(endpoint.dropFirst(5).dropLast(suffix.count))
+            guard path.hasPrefix("/") else { return false }
+            return canonicalPath(URL(fileURLWithPath: path)) == expected
+        }
+    }
+
+    /// QEMU escapes a comma inside an option value as two commas. Decode only
+    /// the file value; another option cannot supply evidence of disk ownership.
+    static func driveFile(_ argument: String) -> URL? {
+        guard argument.hasPrefix("file=") else { return nil }
+        let value = Array(argument.dropFirst(5))
+        var path = ""
+        var index = 0
+        while index < value.count {
+            if value[index] == "," {
+                if index + 1 < value.count, value[index + 1] == "," { path.append(","); index += 2; continue }
+                return path.hasPrefix("/") ? URL(fileURLWithPath: path) : nil
+            }
+            path.append(value[index]); index += 1
+        }
+        return nil
+    }
+
     static func executablePath(_ pid:pid_t)->String? {
         var bytes=[CChar](repeating:0,count:4096)
         guard proc_pidpath(pid,&bytes,UInt32(bytes.count))>0 else {return nil}
@@ -143,8 +191,7 @@ struct HostProcessInspector {
                 let args:[String]
                 do { args=try arguments(pid) }
                 catch { if kill(pid,0) != 0 && errno==ESRCH { continue };throw error }
-                let endpoint="unix:\(runtime.appendingPathComponent("qmp.sock").path),server=on,wait=off"
-                guard args.indices.contains(where:{args[$0]=="-qmp" && $0+1<args.count && args[$0+1]==endpoint}) else { continue }
+                guard matchesEndpoint(args, runtime: runtime) else { continue }
                 let id = try ProcessIdentity.capture(pid)
                 guard try arguments(pid)==args,try ProcessIdentity.capture(pid) == id else { throw BridgeError("Идентичность QEMU изменилась") }
                 result.append(ProcessSnapshot(identity: id, arguments: args))
@@ -155,11 +202,7 @@ struct HostProcessInspector {
     }
 
     static func classify(_ processes: [ProcessSnapshot], runtime: URL) -> VMOwnership {
-        let endpoint = "unix:\(runtime.appendingPathComponent("qmp.sock").path),server=on,wait=off"
-        let matches = processes.filter { process in
-            let args = process.arguments
-            return args.indices.contains { args[$0] == "-qmp" && $0 + 1 < args.count && args[$0 + 1] == endpoint }
-        }
+        let matches = processes.filter { matchesEndpoint($0.arguments, runtime: runtime) }
         guard matches.count <= 1 else { return .unknown("Найдено несколько VM одного runtime") }
         guard let process = matches.first else { return .absent }
         guard process.identity.audit.count == 8,
@@ -167,12 +210,19 @@ struct HostProcessInspector {
               URL(fileURLWithPath: process.identity.executable).lastPathComponent == "qemu-system-x86_64" else {
             return .unknown("Идентичность исполняемого файла QEMU не подтверждена")
         }
-        let diskPrefix = "file=" + runtime.appendingPathComponent("generations").path.replacingOccurrences(of: ",", with: ",,") + "/"
-        guard process.arguments.contains(where: { $0.hasPrefix(diskPrefix) && $0.contains("/guest.qcow2,") }) else {
+        let generations = canonicalPath(runtime).appendingPathComponent("generations")
+        let disks = process.arguments.indices.compactMap { index -> URL? in
+            guard process.arguments[index] == "-drive", index + 1 < process.arguments.count,
+                  let file = driveFile(process.arguments[index + 1]) else { return nil }
+            let path = canonicalPath(file)
+            guard path.lastPathComponent == "guest.qcow2",
+                  path.deletingLastPathComponent().deletingLastPathComponent().path == generations.path else { return nil }
+            return path
+        }
+        guard let disk = disks.first else {
             return .unknown("QMP-путь занят процессом без подтверждённого диска поколения")
         }
-        let disk = process.arguments.first { $0.hasPrefix(diskPrefix) } ?? ""
-        let generation = String(disk.dropFirst(diskPrefix.count).prefix(while: { $0 != "/" }))
+        let generation = disk.deletingLastPathComponent().lastPathComponent
         guard UUID(uuidString: generation) != nil else { return .unknown("Поколение процесса не распознано") }
         let nameIndex = process.arguments.firstIndex(of: "-name")
         let name = nameIndex.flatMap { $0 + 1 < process.arguments.count ? process.arguments[$0 + 1] : nil }

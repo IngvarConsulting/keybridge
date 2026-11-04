@@ -21,25 +21,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Test Swift components
+      - name: Test Swift components and native interface
         run: swift test
+      - name: Verify stopping an owned process without the agent
+        run: KEYBRIDGE_TEST_CONTROL="$(swift build --show-bin-path)/KeyBridgeControl" python3 -m unittest discover -s Tests/Controller -p 'test_*.py'
 
-  interface-and-guest:
+  guest-and-packaging:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: '24'
-          package-manager-cache: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
-      - name: Test interface state
-        run: node --test Tests/Interface/state.test.cjs
       - name: Test guest commands on fixtures
         run: python3 -m unittest discover -s Tests/Guest -p 'test_*.py'
       - name: Test release packaging checks

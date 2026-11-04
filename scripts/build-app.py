@@ -28,8 +28,15 @@ BUILD_ROOT = Path(os.environ.get("KEYBRIDGE_BUILD_ROOT", str(Path.home() / "Libr
 WORK = BUILD_ROOT / "build"
 SYSTEM_PREFIXES = ("/System/Library/", "/usr/lib/")
 PRODUCTS = ("KeyBridgeApp", "KeyBridgeAgent", "KeyBridgeControl", "KeyBridgeConfigure")
-PRODUCT_IDENTIFIERS = {"KeyBridgeApp": "pro.keybridge.pilot", "KeyBridgeAgent": "pro.keybridge.pilot.agent",
-                       "KeyBridgeControl": "pro.keybridge.pilot.control", "KeyBridgeConfigure": "pro.keybridge.pilot.configure"}
+DEFAULT_BUNDLE_IDENTIFIER = "pro.keybridge.pilot"
+
+
+def product_identifiers(bundle_identifier: str) -> dict[str, str]:
+    if (len(bundle_identifier) > 200
+            or not re.fullmatch(r"(?:[A-Za-z][A-Za-z0-9-]*\.)+[A-Za-z][A-Za-z0-9-]*", bundle_identifier)):
+        raise ValueError("Expected a reverse-DNS --bundle-id using letters, digits and hyphens")
+    return {"KeyBridgeApp": bundle_identifier, "KeyBridgeAgent": bundle_identifier + ".agent",
+            "KeyBridgeControl": bundle_identifier + ".control", "KeyBridgeConfigure": bundle_identifier + ".configure"}
 
 
 def run(*args: str | Path, capture: bool = False) -> str:
@@ -247,33 +254,35 @@ def bundle_app_icon(resources: Path) -> None:
 
 
 def bundle_source_resources(resources: Path) -> None:
-    # Source scripts/manifests only. The broad project tree is never copied into the app.
+    # Native SwiftUI uses only the named brand image; prototype web files never ship.
     interface = ROOT / "Resources" / "interface"
-    if not (interface / "keybridge.html").is_file():
-        raise RuntimeError("Missing KeyBridge application interface")
-    for source in sorted(interface.rglob("*")):
-        if source.is_symlink():
-            raise RuntimeError(f"Interface resource symlinks are not allowed: {source}")
-        if source.is_file():
-            data = source.read_bytes()
-            if source.relative_to(interface).as_posix() == "ingvar-consulting.png":
-                validate_brand_png(data)
-            elif source.suffix not in (".html", ".css", ".js") or b"\x00" in data:
-                raise RuntimeError(f"Unexpected interface resource: {source.name}")
-            target = resources / "interface" / source.relative_to(interface)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
-    guest = ROOT / "Resources" / "guest"
-    if guest.exists():
-        for source in sorted(guest.rglob("*")):
+    source = interface / "ingvar-consulting.png"
+    if any(path.is_symlink() for path in (ROOT / "Resources", interface, source)):
+        raise RuntimeError("Brand image resource symlinks are not allowed")
+    if not source.is_file():
+        raise RuntimeError("Missing KeyBridge brand image")
+    validate_brand_png(source.read_bytes())
+    target = resources / "interface" / source.name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    for folder, suffixes in [("guest", (".sh", ".py", ".json", ".xml", ".service", ".conf", ".cfg", ".txt")),
+                             ("probe", (".xml", ".bsl"))]:
+        root = ROOT / "Resources" / folder
+        if not root.exists():
+            if folder == "probe":
+                raise RuntimeError("Missing client license probe sources")
+            continue
+        for source in sorted(root.rglob("*")):
             if source.is_symlink():
                 raise RuntimeError(f"Resource symlinks are not allowed: {source}")
             if source.is_file():
-                if source.suffix not in (".sh", ".py", ".json", ".xml", ".service", ".conf", ".cfg", ".txt"):
-                    raise RuntimeError(f"Unexpected guest resource: {source.name}")
+                if folder == "probe" and source.name == "README.md":
+                    continue
+                if source.suffix not in suffixes:
+                    raise RuntimeError(f"Unexpected {folder} resource: {source.name}")
                 if b"\x00" in source.read_bytes():
-                    raise RuntimeError(f"Binary guest resource is forbidden: {source.name}")
-                target = resources / "guest" / source.relative_to(guest)
+                    raise RuntimeError(f"Binary {folder} resource is forbidden: {source.name}")
+                target = resources / folder / source.relative_to(root)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target)
     for name in ("image.json",):
@@ -286,15 +295,28 @@ def bundle_source_resources(resources: Path) -> None:
             shutil.copy2(source, resources / name)
 
 
+def production_source_paths() -> list[Path]:
+    # The builder determines resource packaging and signing identities.
+    return ([ROOT / "Package.swift", ROOT / "scripts/build-app.py", ROOT / "scripts/build-alpine-base.py",
+             ROOT / "scripts/configure-alpine-base.sh", ROOT / "Resources/app-icon.png",
+             ROOT / "Resources/interface/ingvar-consulting.png"]
+            + sorted((ROOT / "Sources").rglob("*.swift"))
+            + sorted((ROOT / "Resources/guest").glob("*.*"))
+            + sorted(path for path in (ROOT / "Resources/probe").rglob("*") if path.is_file() and path.suffix in (".xml", ".bsl")))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--runtime-only", action="store_true", help="Build/test relocated QEMU before Swift targets are ready")
     parser.add_argument("--output", type=Path, default=WORK / "KeyBridge.app")
-    parser.add_argument("--sign-identity", default="-", help="Local Keychain signing identity; default ad-hoc does not support login launch")
+    parser.add_argument("--sign-identity", default="-", help="Local Keychain signing identity; default ad-hoc")
+    parser.add_argument("--bundle-id", default=DEFAULT_BUNDLE_IDENTIFIER,
+                        help="Application identity; use a separate identity for isolated acceptance builds")
     parser.add_argument("--version", default="0.1.0", help="Three-part application version")
     parser.add_argument("--build-number", default="1", help="Positive application build number")
     args = parser.parse_args()
+    identifiers = product_identifiers(args.bundle_id)
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", args.version) or not re.fullmatch(r"[1-9][0-9]*", args.build_number):
         raise RuntimeError("Expected --version major.minor.patch and a positive --build-number")
     if BUILD_ROOT == ROOT or ROOT in BUILD_ROOT.parents:
@@ -308,9 +330,7 @@ def main() -> None:
         raise RuntimeError("Build output must remain outside the source directory")
     destination.parent.mkdir(parents=True, exist_ok=True)
     WORK.mkdir(parents=True, exist_ok=True)
-    source_paths = ([ROOT / "Package.swift", ROOT / "Resources/app-icon.png"] + sorted((ROOT / "Sources").rglob("*.swift"))
-                    + sorted((ROOT / "Resources/guest").glob("*.*"))
-                    + sorted((ROOT / "Resources/interface").rglob("*.*")))
+    source_paths = production_source_paths()
     source_hashes = {str(path.relative_to(ROOT)): sha256(path) for path in source_paths if path.is_file()}
     if not args.runtime_only and not args.skip_build:
         run("/usr/bin/xcrun", "swift", "build", "--package-path", ROOT,
@@ -336,19 +356,19 @@ def main() -> None:
     resources.mkdir()
     entitlements = stage_parent / "qemu-entitlements.plist"
     entitlements.write_bytes(plistlib.dumps({"com.apple.security.cs.allow-jit": True, "com.apple.security.cs.disable-library-validation": True}))
-    info = {"CFBundleIdentifier": "pro.keybridge.pilot", "CFBundleName": "KeyBridge",
+    info = {"CFBundleIdentifier": args.bundle_id, "CFBundleName": "KeyBridge",
             "CFBundleDisplayName": "KeyBridge", "CFBundleExecutable": "KeyBridgeApp",
             "CFBundleIconFile": "AppIcon.icns",
             "CFBundlePackageType": "APPL", "CFBundleShortVersionString": args.version,
             "CFBundleVersion": args.build_number, "LSMinimumSystemVersion": "27.0",
             "LSUIElement": False, "NSHighResolutionCapable": True,
-            "KeyBridgeLoginLaunchSupported": args.sign_identity != "-",
+            "KeyBridgeLoginLaunchSupported": not args.runtime_only,
             "NSPrincipalClass": "NSApplication", "NSHumanReadableCopyright": "KeyBridge contributors; own code MIT"}
     (contents / "Info.plist").write_bytes(plistlib.dumps(info))
     (contents / "PkgInfo").write_bytes(b"APPL????")
-    agent = contents / "Library" / "LaunchAgents" / "pro.keybridge.pilot.agent.plist"
+    agent = contents / "Library" / "LaunchAgents" / (identifiers["KeyBridgeAgent"] + ".plist")
     agent.parent.mkdir(parents=True)
-    agent.write_bytes(plistlib.dumps({"Label": "pro.keybridge.pilot.agent",
+    agent.write_bytes(plistlib.dumps({"Label": identifiers["KeyBridgeAgent"],
           "BundleProgram": "Contents/MacOS/KeyBridgeAgent", "RunAtLoad": True,
           # Licensing RPCs and user-requested checks must stay responsive.
           # This file-queue pilot cannot use XPC-driven Adaptive promotion.
@@ -366,9 +386,10 @@ def main() -> None:
             target.chmod(0o755)
             assert_arm64(target)
             run("/usr/bin/codesign", "--force", "--sign", args.sign_identity,
-                "--identifier", PRODUCT_IDENTIFIERS[name], "--timestamp=none", target)
+                "--identifier", identifiers[name], "--timestamp=none", target)
     (resources / "build-inventory.json").write_text(json.dumps({"local_pilot": True,
         "signature": "ad-hoc" if args.sign_identity == "-" else "keychain-identity", "notarized": False, "runtime_only": args.runtime_only,
+        "compiled_from_sources": not args.skip_build and not args.runtime_only,
         "architecture": "arm64", "runtime_files": inventory, "sources_sha256": source_hashes,
         "proprietary_components_included": False}, indent=2) + "\n")
     (resources / ".keybridge-build-marker").write_text("Generated by KeyBridge build-app.py\n")
@@ -397,6 +418,6 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except (RuntimeError, OSError, subprocess.CalledProcessError) as exc:
+    except (RuntimeError, ValueError, OSError, subprocess.CalledProcessError) as exc:
         print(f"Build failed: {exc}", file=sys.stderr)
         raise SystemExit(1)

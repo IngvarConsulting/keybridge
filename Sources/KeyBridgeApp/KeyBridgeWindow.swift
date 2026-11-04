@@ -1,86 +1,35 @@
 // SPDX-License-Identifier: MIT
 import AppKit
-import WebKit
+import Combine
+import SwiftUI
 
-/// The packaged document owns presentation, never runtime or filesystem access.
 @MainActor
-final class KeyBridgeWindowController: NSViewController, WKNavigationDelegate, WKScriptMessageHandler {
+final class KeyBridgeWindowController: NSViewController {
     private let model: AppModel
+    private let interface: KeyBridgeInterfaceState
     private let initialContentSize: NSSize
-    private var webView: WKWebView!
-    private var ready = false
-    private var pendingNavigation: String?
+    private var observations: AnyCancellable?
     init(model: AppModel, contentSize: NSSize) {
         self.model = model
-        initialContentSize = contentSize
+        self.interface = KeyBridgeInterfaceState(send: { [weak model] in model?.receive($0) })
+        self.initialContentSize = contentSize
         super.init(nibName: nil, bundle: nil)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
-
     override func loadView() {
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .nonPersistent()
-        configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
-        configuration.userContentController.add(WeakScriptHandler(self), name: "keybridge")
-        webView = WKWebView(frame: NSRect(origin: .zero, size: initialContentSize), configuration: configuration)
-        webView.navigationDelegate = self
-        webView.allowsBackForwardNavigationGestures = false
-        webView.setValue(false, forKey: "drawsBackground")
-        view = NSView(frame: webView.frame)
-        webView.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(webView)
+        let hosting = NSHostingController(rootView: KeyBridgeNativeView(interface: interface))
+        addChild(hosting)
+        view = NSView(frame: NSRect(origin: .zero, size: initialContentSize))
+        hosting.view.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(hosting.view)
         NSLayoutConstraint.activate([
-            webView.topAnchor.constraint(equalTo: view.topAnchor), webView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            webView.leadingAnchor.constraint(equalTo: view.leadingAnchor), webView.trailingAnchor.constraint(equalTo: view.trailingAnchor)
+            hosting.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            hosting.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            hosting.view.topAnchor.constraint(equalTo: view.topAnchor),
+            hosting.view.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
-        model.didChange = { [weak self] value in self?.send(value) }
-        model.navigate = { [weak self] destination in
-            guard let self else { return }
-            if self.ready { Task { _ = try? await self.webView.callAsyncJavaScript("window.KeyBridge.navigate(destination)", arguments: ["destination": destination], in: nil, contentWorld: .page) } }
-            else { self.pendingNavigation = destination }
-        }
-        var page = Bundle.main.resourceURL?.appendingPathComponent("interface/keybridge.html")
-        #if DEBUG
-        if page == nil || !FileManager.default.fileExists(atPath: page!.path) {
-            page = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Resources/interface/keybridge.html")
-        }
-        #endif
-        if let page, FileManager.default.fileExists(atPath: page.path) {
-            webView.loadFileURL(page, allowingReadAccessTo: page.deletingLastPathComponent())
-        } else {
-            let message = NSTextField(wrappingLabelWithString: "Не удалось открыть KeyBridge: в приложении отсутствует интерфейс. Установите полную сборку KeyBridge.")
-            message.frame = NSRect(x: 24, y: 220, width: 712, height: 80)
-            view.addSubview(message)
-        }
-    }
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        ready = true
-        send(model.payload)
-        if let destination = pendingNavigation { pendingNavigation = nil; model.navigate?(destination) }
-    }
-    private func send(_ payload: [String: Any]) {
-        guard ready else { return }
-        Task { _ = try? await webView.callAsyncJavaScript("window.KeyBridge.update(snapshot)", arguments: ["snapshot": payload], in: nil, contentWorld: .page) }
-    }
-    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard message.frameInfo.isMainFrame, message.name == "keybridge",
-              message.frameInfo.request.url?.isFileURL == true,
-              let request = message.body as? [String: Any] else { return }
-        model.receive(request)
-    }
-    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-        guard let url = navigationAction.request.url else { decisionHandler(.cancel); return }
-        if navigationAction.navigationType == .linkActivated {
-            model.openExternal(url); decisionHandler(.cancel)
-        } else if url.isFileURL || url.absoluteString == "about:blank" { decisionHandler(.allow) }
-        else { decisionHandler(.cancel) }
-    }
-}
-
-private final class WeakScriptHandler: NSObject, WKScriptMessageHandler {
-    weak var target: WKScriptMessageHandler?
-    init(_ target: WKScriptMessageHandler) { self.target = target }
-    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        target?.userContentController(userContentController, didReceive: message)
+        interface.update(model.payload)
+        observations = model.$payload.sink { [weak interface] in interface?.update($0) }
+        model.navigate = { [weak interface] in interface?.navigate($0) }
     }
 }

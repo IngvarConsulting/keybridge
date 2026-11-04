@@ -50,7 +50,7 @@ public enum RuntimeResources {
     public static func disk(runtime:URL,resources:URL)->[String:Any] {
         let store=GenerationStore(runtime:runtime)
         let selected=readObject(runtime.appendingPathComponent("current.json"))["generation"] as? String
-        let previous=readObject(runtime.appendingPathComponent("previous.json"))["generation"] as? String
+        let previous=store.presentation()["previousGeneration"] as? String
         let published=Set(store.records().compactMap{$0["generation"] as? String})
         let folder=runtime.appendingPathComponent("generations")
         let generations=((try?FileManager.default.contentsOfDirectory(at:folder,includingPropertiesForKeys:nil)) ?? []).map { url ->[String:Any] in

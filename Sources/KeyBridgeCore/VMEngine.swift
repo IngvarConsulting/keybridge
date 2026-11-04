@@ -7,9 +7,13 @@ public enum VMEngineError: Error, LocalizedError {
     case message(String)
     case cancelled
     case safety(String)
+    case channel(String)
+    case qmp(String)
+    case services([String])
     public var errorDescription: String? {
         switch self {
-        case .message(let value), .safety(let value): return value
+        case .message(let value), .safety(let value), .channel(let value), .qmp(let value): return value
+        case .services(let names): return "Требуется восстановление служб: " + names.joined(separator: ", ")
         case .cancelled: return "Подготовка отменена. Рабочая среда сохранена."
         }
     }
@@ -29,12 +33,22 @@ public final class VMEngine {
     var guestTransport:((URL,String,Data?) throws ->String)?
     var observeUSB:(() throws ->[USBConnection])?
     var shutdownGuest:((URL)->Void)?
+    var subscribeRuntimeChanges:((URL)throws->Void)?
     var pause: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }
     public var operationCancelled: (() -> Bool)?
     public var publicationBarrier: (((() throws -> Void)) throws -> Void)?
     public var usbChanged:(()->Void)?
+    public var runtimeChanged:(()->Void)?
+    private var serviceObserver:Process?
+    private let qmpLock=NSLock()
+    private var qmpObserver:DispatchSourceRead?
+    private var observedQMP:Int32?
+    private var qmpReadBuffer=Data()
+    private var qmpObservationLost=false
+    var qmpTimeout:TimeInterval = 8
     public var stateSink: (([String:Any]) -> Void)?
     public var hasConnectionContext:Bool { usbMonitor != nil || observeUSB != nil }
+    private let usbMonitorLock=NSLock()
     private var usbMonitor:USBMonitor?
     private var capturedUSB:USBConnection?
     private var preparing = false
@@ -59,7 +73,7 @@ public final class VMEngine {
             let succeeded = recovered["state"] as? String == "succeeded"
             let message = succeeded ? "Среда готова. Можно запустить раздачу." : "Подготовка прервана перезапуском фонового агента. Повторите подготовку."
             update(["status": succeeded ? "stopped" : "error", "phase": recovered["phase"] ?? "verify",
-                    "busy": false, "running": ownPID() != nil, "message": message,
+                    "busy": false, "running": observeProcesses(self.runtime).running, "message": message,
                     "lastError": succeeded ? NSNull() : message as Any])
         }
     }
@@ -69,13 +83,16 @@ public final class VMEngine {
         if result.isEmpty { result = ["status":"unprepared", "message":"Добавьте свои установщики", "busy":false, "running":false] }
         let observation = observeProcesses(runtime)
         result["ownership"] = observation.name
-        result["running"] = observation.identity != nil
-        if case .unknown(let reason) = observation { result["ownershipError"] = reason }
-        let generation=try? GenerationStore(runtime:runtime).current()
+        result["running"] = observation.running
+        if case .unknown(let reason) = observation {
+            result["ownershipError"] = reason
+        } else { result["ownershipError"] = NSNull() }
+        let generations=GenerationStore(runtime:runtime).snapshot()
+        let generation=generations.current
         result["prepared"] = generation != nil
-        result["generations"] = GenerationStore(runtime:runtime).summaries()
-        result.merge(GenerationStore(runtime:runtime).presentation()){_,new in new}
-        result["cpus"] = generation?.backend == "debian" ? 2 : 1
+        result["generations"] = generations.summaries
+        result.merge(generations.presentation){_,new in new}
+        result["cpus"] = 1
         result["runID"] = observationRunID(observation)
         if var sample=result["resources"] as? [String:Any] {
             sample["historical"] = !NSDictionary(dictionary:sample["context"] as? [String:Any] ?? [:]).isEqual(to:resourceContext(observation))
@@ -109,24 +126,30 @@ public final class VMEngine {
             switch action {
             case "prepare": try withPreparation { try prepare(request) }
             case "start": try start()
-            case "rollback": try rollback(request["generation"] as? String)
+            case "rollback": try rollback()
             case "stop": try stop()
             case "attach": try attach()
             case "health": try health()
+            case "inspect": try inspectRuntime()
+            case "recover-channel": try recoverChannel()
+            case "recover-services": try recoverServices(request["services"] as? [String] ?? [])
             case "licenseEvidence": return try licenseEvidence(request["baseline"] as? [String:Any])
             case "resources": return try resourceUsage()
             default: throw VMEngineError.message("Неизвестное действие: \(action)")
             }
             return status()
         } catch {
-            var failure: [String: Any] = ["status":"error", "busy":false, "message":error.localizedDescription, "lastError":error.localizedDescription, "running":ownPID() != nil]
+            if action == "resources" { throw error }
+            let ownership=observeProcesses(runtime)
+            var failure: [String: Any] = ["status":"error", "busy":false, "message":error.localizedDescription, "lastError":error.localizedDescription, "running":ownership.running,"ownership":ownership.name]
+            if case .unknown(let reason)=ownership { failure["ownershipError"]=reason }
             if action == "prepare", let phase = readJSON(runtime.appendingPathComponent("preparation.json"))?["phase"] as? String { failure["phase"] = phase }
             update(failure)
             throw error
         }
     }
 
-    private func update(_ values: [String: Any]) {
+    func update(_ values: [String: Any]) {
         var state = readJSON(statePath) ?? [:]
         for (key, value) in values { state[key] = value }
         state["updatedAt"] = ISO8601DateFormatter().string(from:Date())
@@ -135,14 +158,17 @@ public final class VMEngine {
         state["platformVersion"] = version
         state["guestOS"] = readJSON(manifestPath)?["backend"] ?? "unknown"
         state["memoryMiB"] = readJSON(manifestPath)?["memoryMiB"] ?? 128
+        if let stateSink {
+            // With an agent, that controller is the only status writer. A raw
+            // engine write here would briefly publish false idle on disk, or
+            // let a cancelled operation bypass its publication barrier.
+            var patch=values
+            for key in ["updatedAt","prepared","endpoint","platformVersion","guestOS","memoryMiB"] { patch[key]=state[key] }
+            stateSink(patch)
+            return
+        }
         do { try writeJSON(state,to:statePath) }
         catch { state["persistenceError"]=error.localizedDescription; fputs("KeyBridge status: \(error.localizedDescription)\n",stderr) }
-        // Publish only this observation; never overwrite the agent's newer proof
-        // with a historical result re-read from disk.
-        var patch=values
-        patch["prepared"]=state["prepared"]
-        patch["persistenceError"]=state["persistenceError"]
-        stateSink?(patch)
     }
 
     private func readJSON(_ path: URL) -> [String:Any]? {
@@ -263,6 +289,8 @@ public final class VMEngine {
                 "rmlic_timeout":"Менеджер запущен, но не открыл порт лицензирования за отведённое время",
                 "runtime_readiness_timeout":"Драйвер HASP не завершил подготовку своего диагностического API вовремя",
                 "firmware_updates_not_disabled":"Runtime не подтвердил запрет обновления прошивки ключа",
+                "guest_disk_full":"Внутри Linux не хватает места для подготовки компонентов",
+                "guest_memory":"Linux зарегистрировал нехватку памяти во время подготовки",
                 "stage_imports":"Не удалось проверить импортированные установщики",
                 "stage_verify_imports":"Не удалось проверить установщики в Alpine",
                 "invalid_driver_package":"Выбранный файл не является исправным DEB-пакетом",
@@ -389,12 +417,6 @@ public final class VMEngine {
         readJSON(generation.appendingPathComponent("guest.json"))?["backend"] as? String == "alpine"
     }
 
-    private func preservePreviousManifest() throws {
-        if let previous = readJSON(manifestPath) {
-            try writeJSON(previous, to:runtime.appendingPathComponent("previous.json"))
-        }
-    }
-
     private func currentGeneration() throws -> URL {
         try GenerationStore(runtime:runtime).current().folder
     }
@@ -405,9 +427,9 @@ public final class VMEngine {
         else { try body() }
     }
 
-    private func rollback(_ requested:String?) throws {
+    private func rollback() throws {
         try requireAbsent()
-        let selected=try GenerationStore(runtime:runtime).rollback(requested)
+        let selected=try GenerationStore(runtime:runtime).rollback()
         let imageTool=try nativeBinary("qemu-img")
         _ = try run(imageTool.path,["check","-f","qcow2",selected.folder.appendingPathComponent("guest.qcow2").path],timeout:120)
         try publishCurrent { try GenerationStore(runtime:self.runtime).publish(selected.manifest) }
@@ -419,31 +441,28 @@ public final class VMEngine {
         let binary=try nativeBinary("qemu-system-x86_64")
         guard qmpPath.path.utf8.count < 104 else { throw VMEngineError.message("Путь к данным слишком длинный для управления VM.") }
         for port in [Self.sshPort,Self.managerPort] { try checkPort(port) }
+        try checkPort(Self.managerPort, datagram:true)
         for path in [qmpPath,pidPath] { try? fm.removeItem(at:path) }
-        let network="user,id=lan,restrict=\(installing && !isAlpine(generation) ? "off" : "on"),hostfwd=tcp:127.0.0.1:\(Self.sshPort)-:22,hostfwd=tcp:127.0.0.1:\(Self.managerPort)-:1544"
+        let network="user,id=lan,restrict=on,hostfwd=tcp:127.0.0.1:\(Self.sshPort)-:22,hostfwd=tcp:127.0.0.1:\(Self.managerPort)-:1544,hostfwd=udp:127.0.0.1:\(Self.managerPort)-:475"
         func disk(_ name: String)->String { generation.appendingPathComponent(name).path.replacingOccurrences(of:",",with:",,") }
-        let alpine = isAlpine(generation)
+        guard isAlpine(generation) else { throw VMEngineError.message("Поддерживается только Alpine с 128 МиБ и одним vCPU") }
         let runID = UUID().uuidString
         var args=["-name","keybridge-" + runID,"-L",resources.appendingPathComponent("runtime/share/qemu").path,"-machine","q35",
-                  "-accel",alpine ? "tcg,thread=single,tb-size=16" : "tcg,thread=multi","-cpu","max","-smp",alpine ? "1" : "2","-m",alpine ? "128" : "1024",
+                  "-accel","tcg,thread=single,tb-size=16","-cpu","max","-smp","1","-m","128",
                   "-nodefaults","-display","none","-monitor","none","-serial","file:\(runtime.appendingPathComponent("logs/serial.log").path)",
                   "-qmp","unix:\(qmpPath.path),server=on,wait=off","-pidfile",pidPath.path,
                   "-drive","file=\(disk("guest.qcow2")),if=virtio,format=qcow2,discard=unmap",
                   "-netdev",network,"-device","virtio-net-pci,netdev=lan","-device","qemu-xhci,id=xhci"]
-        if alpine {
-            for name in ["seed.iso", "imports.iso"] where installing && fm.fileExists(atPath:generation.appendingPathComponent(name).path) {
-                args += ["-drive","file=\(disk(name)),if=ide,media=cdrom,readonly=on"]
-            }
-            args += ["-kernel",generation.appendingPathComponent("vmlinuz-virt").path,
-                     "-initrd",generation.appendingPathComponent("initramfs-virt").path,
-                     "-append","root=/dev/vda rootfstype=ext4 rw console=ttyS0 modules=virtio_pci,virtio_blk,ext4"]
-        } else {
-            args += ["-drive","file=\(disk("seed.iso")),if=ide,media=cdrom,readonly=on"]
-            if installing && fm.fileExists(atPath:generation.appendingPathComponent("imports.iso").path) { args += ["-drive","file=\(disk("imports.iso")),if=ide,media=cdrom,readonly=on"] }
+        for name in ["seed.iso", "imports.iso"] where installing && fm.fileExists(atPath:generation.appendingPathComponent(name).path) {
+            args += ["-drive","file=\(disk(name)),if=ide,media=cdrom,readonly=on"]
         }
+        args += ["-kernel",generation.appendingPathComponent("vmlinuz-virt").path,
+                 "-initrd",generation.appendingPathComponent("initramfs-virt").path,
+                 "-append","root=/dev/vda rootfstype=ext4 rw console=ttyS0 modules=virtio_pci,virtio_blk,ext4"]
         let log=runtime.appendingPathComponent("logs/qemu.log"); if !fm.fileExists(atPath:log.path) { fm.createFile(atPath:log.path,contents:nil) }
         let handle=try FileHandle(forWritingTo:log); try handle.seekToEnd()
         let process=Process();process.executableURL=binary;process.arguments=args;process.standardInput=FileHandle.nullDevice;process.standardOutput=handle;process.standardError=handle
+        process.terminationHandler = { [weak self] _ in self?.runtimeChanged?() }
         try process.run();try? handle.close();child=process;ownedGeneration=generation
         try writeJSON(["pid":process.processIdentifier,"generation":generation.lastPathComponent,"runID":runID,"installing":installing],to:runtime.appendingPathComponent("active-vm.json"))
         for _ in 0..<100 {
@@ -461,15 +480,15 @@ public final class VMEngine {
     private func start() throws {
         switch observeProcesses(runtime) {
         case .owned: try health(); return
-        case .absent: capturedUSB=nil
+        case .absent: stoppedCleanup()
         case .unknown(let reason): throw VMEngineError.safety("Владелец VM не установлен: " + reason)
         }
         let generation=try currentGeneration()
-        update(["status":"starting","phase":"boot","busy":true,"running":false,"message":"Запуск Linux и менеджера лицензий","lastError":NSNull(),"lastProbe":NSNull()])
+        update(["status":"starting","phase":"boot","busy":true,"running":false,"keyConnected":false,"keyConnection":NSNull(),"message":"Запуск Linux и менеджера лицензий","lastError":NSNull(),"lastProbe":NSNull()])
         do {
             try launch(generation,installing:false)
             try awaitSSH(generation,timeout:420)
-            let services = isAlpine(generation) ? "sudo /usr/local/sbin/keybridge-services start" : "sudo systemctl start aksusbd hasplmd keybridge-rmlic"
+            let services = "sudo /usr/local/sbin/keybridge-services start"
             _ = try ssh(generation,services + " && sudo /usr/local/bin/keybridge-rmlic-ready 90",timeout:110)
             try attach()
         } catch {
@@ -483,8 +502,14 @@ public final class VMEngine {
     }
 
     private func ssh(_ generation: URL, _ command:String,input:Data?=nil,timeout:TimeInterval=40) throws -> String {
-        if let guestTransport { return try guestTransport(generation,command,input) }
-        return try run("/usr/bin/ssh",sshOptions(generation)+[command],input:input,timeout:timeout)
+        do {
+            if let guestTransport { return try guestTransport(generation,command,input) }
+            return try run("/usr/bin/ssh",sshOptions(generation)+[command],input:input,timeout:timeout)
+        } catch {
+            if let error=error as? VMEngineError, case .cancelled=error { throw error }
+            try checkCancellation()
+            throw VMEngineError.channel("Канал SSH или гостевая команда недоступны: " + error.localizedDescription)
+        }
     }
 
     private func awaitSSH(_ generation:URL,timeout:TimeInterval) throws {
@@ -498,15 +523,24 @@ public final class VMEngine {
         throw VMEngineError.message("Linux не завершил загрузку вовремя; смотрите локальный serial.log.")
     }
 
-    private func liveGeneration() throws -> URL {
-        guard case .owned(_, let generation?, _) = observeProcesses(runtime) else {
+    private func liveGeneration(_ observation:VMOwnership? = nil) throws -> URL {
+        guard case .owned(_, let generation?, _) = observation ?? observeProcesses(runtime) else {
             throw VMEngineError.message("Поколение работающей VM не подтверждено")
         }
         return runtime.appendingPathComponent("generations/" + generation)
     }
 
+    public func usbObservation() throws -> [USBConnection] {
+        let connections: [USBConnection]
+        do { connections=try currentUSBConnections() }
+        catch { throw VMEngineError.safety("Наблюдатель USB недоступен: " + error.localizedDescription) }
+        guard connections.count <= 1 else { throw VMEngineError.safety("Найдено несколько USB-ключей") }
+        return connections
+    }
+
     private func currentUSBConnections() throws ->[USBConnection] {
         if let observeUSB { return try observeUSB() }
+        usbMonitorLock.lock();defer { usbMonitorLock.unlock() }
         if usbMonitor == nil { usbMonitor=try USBMonitor(resources:resources,changed:{ [weak self] in self?.usbChanged?() }) }
         return try usbMonitor!.snapshot()
     }
@@ -516,12 +550,12 @@ public final class VMEngine {
         catch let error as VMEngineError {
             if case .cancelled=error { throw error }
             if case .safety=error { try?stopVM() }
+            if case .qmp=error { try?stopVM() }
             throw error
         }
     }
 
     private func attachChecked() throws {
-        guard ownPID() != nil else { throw VMEngineError.message("VM не запущена.") }
         let generation=try liveGeneration()
         let connections:[USBConnection]
         do {
@@ -529,17 +563,23 @@ public final class VMEngine {
         } catch { throw VMEngineError.safety("Состояние USB неизвестно: "+error.localizedDescription) }
         guard connections.count<=1 else { update(["safetyReasonCode":"multiple-keys"]);throw VMEngineError.safety("Несколько HASP-ключей: раздача прекращена") }
         if let capturedUSB,connections.first != capturedUSB {
-            self.capturedUSB=nil
-            throw VMEngineError.safety("Подключение ключа изменилось; требуется новый запуск")
+            try releaseCapture()
         }
+        // Subscribe before reading protection: a change during the handshake
+        // must be covered by the following read, and later changes by events.
+        try armRuntimeObservers(generation)
         // Use this app's read-only checker, including readiness fixes, for existing VMs too.
         guard let guardScript=try?Data(contentsOf:resources.appendingPathComponent("guest/sentinel_guard.py")) else {
             update(["safetyReasonCode":"firmware-unknown"]);throw VMEngineError.safety("Проверка защиты прошивки недоступна")
         }
         let guardJSON:String
         do { guardJSON=try ssh(generation,"python3 - check-config",input:guardScript,timeout:55) }
-        catch { update(["safetyReasonCode":"firmware-unknown"]);throw VMEngineError.safety("Защита прошивки неизвестна: "+error.localizedDescription) }
+        catch { throw error }
         guard let data=guardJSON.data(using:.utf8), let result=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any], result["status"] as? String == "ok", result["no_auto_fwup"] as? String == "1" else { update(["safetyReasonCode":"firmware-unknown"]);throw VMEngineError.safety("Запрет обновления прошивки ключа не подтверждён; раздача прекращена.") }
+        if connections.isEmpty {
+            try releaseCapture()
+            return
+        }
         let tree=try qmp("human-monitor-command",["command-line":"info qtree"]) as? String ?? ""
         if !tree.contains("physical_hasp") {
             guard let selected=connections.first else {
@@ -554,31 +594,25 @@ public final class VMEngine {
         } else if capturedUSB == nil {
             throw VMEngineError.safety("Передача ключа принадлежит прежнему наблюдателю; нужен новый запуск")
         }
-        let script=try Data(contentsOf:resources.appendingPathComponent("guest/key_info.py"))
-        let keyDeadline = Date().addingTimeInterval(20)
-        var keys = [[String: Any]]()
-        repeat {
-            try checkCancellation()
-            let keysJSON=try ssh(generation,"python3 -",input:script,timeout:15)
-            guard let data=keysJSON.data(using:.utf8), let info=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any], let observed=info["keys"] as? [[String:Any]] else { throw VMEngineError.safety("Runtime вернул неизвестный ответ о ключе.") }
-            guard observed.count <= 1 else { update(["safetyReasonCode":"multiple-keys"]);throw VMEngineError.safety("Runtime обнаружил несколько ключей; выбор неоднозначен.") }
-            keys = observed
-            if keys.count == 1 { break }
-            Thread.sleep(forTimeInterval: 0.5)
-        } while Date() < keyDeadline
-        guard keys.count == 1 else {
-            throw VMEngineError.message("Linux не подтвердил захват выбранного ключа за отведённое время")
+        try observeAttachedKey(generation, wait: 20)
+    }
+
+    private func releaseCapture() throws {
+        if capturedUSB != nil {
+            _ = try qmp("device_del", ["id":"physical_hasp"])
+            // device_del is asynchronous. Do not capture the next epoch until
+            // QMP confirms the stale device was actually removed.
+            let deadline=Date().addingTimeInterval(qmpTimeout)
+            while true {
+                try checkCancellation()
+                let tree=try qmp("human-monitor-command",["command-line":"info qtree"]) as? String ?? ""
+                if !tree.contains("physical_hasp") { break }
+                guard Date()<deadline else { throw VMEngineError.qmp("QMP не подтвердил освобождение прежнего подключения") }
+                pause(0.1)
+            }
         }
-        if isAlpine(generation) {
-            _ = try ssh(generation,"for i in $(seq 1 30); do if sudo test -L /dev/aks/hasp/* && sudo grep -Eq '^(add|bind|change) ' /run/keybridge/usb-events.log; then exit 0; fi; sleep 0.5; done; exit 1",timeout:25)
-        }
-        if let capturedUSB {
-            let observedTree=try qmp("human-monitor-command",["command-line":"info qtree"]) as? String ?? ""
-            guard USBTransfer.matches(observedTree,connection:capturedUSB) else { throw VMEngineError.safety("QMP не подтверждает выбранное подключение ключа") }
-        }
-        guard let capturedUSB,try currentUSBConnections().first == capturedUSB else { throw VMEngineError.safety("Эпоха подключения ключа изменилась") }
-        _ = try ssh(generation,"sudo /usr/local/bin/keybridge-rmlic-ready 30",timeout:45)
-        update(["status":"running","phase":"ready","busy":false,"running":true,"message":"Менеджер доступен. Проверьте получение лицензии в 1С.","keyConnected":true,"usbTransition":"captured","safetyReasonCode":NSNull(),"keyModel":keys[0]["typename"] ?? "Sentinel HL","keyType":"Локальный USB","firmware":keys[0]["firmware"] ?? "","keyConnection":capturedUSB.descriptor,"lastError":NSNull()])
+        capturedUSB=nil
+        update(["status":"waiting-key","busy":false,"running":true,"message":"Менеджер запущен. Ожидание USB-ключа.","keyConnected":false,"keyConnection":NSNull(),"keyModel":NSNull(),"firmware":NSNull(),"lastProbe":NSNull(),"usbTransition":"released"])
     }
 
     private func observationRunID(_ observation:VMOwnership)->String {
@@ -636,18 +670,251 @@ public final class VMEngine {
 
     private func health() throws {
         update(["safetyReasonCode":NSNull()])
-        switch observeProcesses(runtime) {
+        let ownership=observeProcesses(runtime)
+        switch ownership {
         case .absent:
             update(["running":false,"busy":false,"status":"stopped","ownership":"absent","message":"Раздача остановлена","keyConnected":false]); return
         case .owned:
-            let generation=try liveGeneration()
-            if isAlpine(generation) {
-                _ = try ssh(generation,"pidof rmlic >/dev/null && pidof hasplmd_x86_64 >/dev/null && pidof aksusbd_x86_64 >/dev/null",timeout:15)
+            let generation=try liveGeneration(ownership)
+            let connections:[USBConnection]
+            do { connections=try currentUSBConnections() }
+            catch { throw VMEngineError.safety("Наблюдение USB недоступно: " + error.localizedDescription) }
+            guard connections.count <= 1 else { try? stopVM(); throw VMEngineError.safety("Найдено несколько ключей") }
+            if connections.isEmpty {
+                try releaseCapture()
+                try armRuntimeObservers(generation)
+                let result=try guestObservation(generation)
+                guard result["status"] as? String == "ok",result["no_auto_fwup"] as? String == "1" else { throw VMEngineError.safety("Защита прошивки не подтверждена") }
+                if let failed=result["failedServices"] as? [String],!failed.isEmpty { throw VMEngineError.services(failed) }
+                return
             }
-            try attach()
+            if let capturedUSB,connections.first != capturedUSB { try releaseCapture() }
+            if capturedUSB != nil {
+                do { try armRuntimeObservers(generation);try observeAttachedKey(generation, wait: 0) }
+                catch let error as VMEngineError {
+                    if case .safety=error { try? stopVM() }
+                    if case .qmp=error { try? stopVM() }
+                    throw error
+                }
+            } else {
+                try attach()
+            }
         case .unknown(let reason):
             update(["status":"error","ownership":"unknown","busy":false,"keyConnected":NSNull()])
             throw VMEngineError.safety("Состояние VM неизвестно: " + reason)
+        }
+    }
+
+    /// Explicit observation never creates an object or captures a USB device.
+    private func inspectRuntime() throws {
+        let ownership=observeProcesses(runtime)
+        let connections=try usbObservation()
+        var facts:[String:Any] = ["ownership":ownership.name,"running":ownership.running,
+            "physicalKeyCount":connections.count,"physicalKeyConnection":connections.first?.descriptor ?? [:],
+            "protection":"unknown","keyConnected":connections.isEmpty ? false : NSNull()]
+        switch ownership {
+        case .absent:
+            facts.merge(["status":"stopped","keyConnected":false,"message":"VM остановлена. Защита внутри Linux не проверена."]) { _,new in new }
+        case .unknown(let reason):
+            facts["ownershipError"]=reason
+            update(facts)
+            throw VMEngineError.safety("Принадлежность VM неизвестна: " + reason)
+        case .owned:
+            let result=try guestObservation(liveGeneration(ownership))
+            facts["protection"] = result["status"] as? String == "ok" && result["no_auto_fwup"] as? String == "1" ? "confirmed" : "unknown"
+            facts["services"] = result["services"]
+            facts["managerReady"] = result["managerReady"]
+            update(facts)
+            guard facts["protection"] as? String == "confirmed" else { throw VMEngineError.safety("Защита прошивки не подтверждена") }
+            _ = try qmp("query-status")
+            guard let keys=result["keys"] as? [[String:Any]],keys.count<=1 else { throw VMEngineError.safety("Наблюдение ключей Linux неоднозначно") }
+            facts["guestKeys"]=keys
+            if let capturedUSB,connections == [capturedUSB] {
+                let tree=try qmp("human-monitor-command",["command-line":"info qtree"]) as? String ?? ""
+                guard USBTransfer.matches(tree,connection:capturedUSB) else { throw VMEngineError.qmp("QMP не подтвердил текущее подключение USB") }
+                facts["keyConnected"]=keys.count==1
+            }
+            if let failed=result["failedServices"] as? [String], !failed.isEmpty { throw VMEngineError.services(failed) }
+        }
+        update(facts)
+    }
+
+    private func guestObservation(_ generation:URL) throws -> [String:Any] {
+        var sources=[String:String]()
+        for name in ["sentinel_guard", "key_info", "alpine_ready"] {
+            sources[name]=try String(contentsOf:resources.appendingPathComponent("guest/\(name).py"),encoding:.utf8)
+        }
+        let encoded=try JSONSerialization.data(withJSONObject:sources).base64EncodedString()
+        let header="import json, base64\nSOURCES=json.loads(base64.b64decode('\(encoded)'))\n"
+        let script=header + (try String(contentsOf:resources.appendingPathComponent("guest/health.py"),encoding:.utf8))
+        let output=try ssh(generation,"sudo -n python3 -",input:Data(script.utf8),timeout:20)
+        guard let data=output.data(using:.utf8),let result=(try?JSONSerialization.jsonObject(with:data)) as? [String:Any] else {
+            throw VMEngineError.safety("Неизвестный ответ наблюдателя Linux")
+        }
+        return result
+    }
+
+    /// One admitted recovery attempt; the agent owns the persistent budget.
+    private func recoverChannel() throws {
+        let ownership=observeProcesses(runtime)
+        let generation=try liveGeneration(ownership)
+        let connections=try usbObservation()
+        if let capturedUSB,connections != [capturedUSB] {
+            if connections.isEmpty { try releaseCapture(); return }
+            throw VMEngineError.safety("USB-контекст изменился при потере SSH")
+        }
+        try checkCancellation()
+        // A successful authenticated request proves the channel before any action.
+        _ = try ssh(generation,"true",timeout:10)
+        try health()
+    }
+
+    private func recoverServices(_ names:[String]) throws {
+        let allowed=Set(["aksusbd_x86_64","hasplmd_x86_64","rmlic"])
+        guard !names.isEmpty,Set(names).isSubset(of:allowed) else { throw VMEngineError.message("Неизвестная отказавшая служба") }
+        let generation=try liveGeneration()
+        _ = try usbObservation()
+        // Refresh the safety precondition before touching any guest service.
+        let result=try guestObservation(generation)
+        guard result["status"] as? String == "ok",result["no_auto_fwup"] as? String == "1" else { throw VMEngineError.safety("Защита прошивки не подтверждена") }
+        let failed=Set(result["failedServices"] as? [String] ?? [])
+        if names.contains(where:failed.contains) {
+            // The admitted recovery already owns this expected service change.
+            serviceObserver?.terminationHandler=nil;serviceObserver?.terminate();serviceObserver=nil
+        }
+        for name in names where failed.contains(name) {
+            try checkCancellation()
+            let script=try Data(contentsOf:resources.appendingPathComponent("guest/alpine_service.sh"))
+            _ = try ssh(generation,"sudo sh -s -- restart-service " + name,input:script,timeout:30)
+            if name == "rmlic" { _ = try ssh(generation,"sudo /usr/local/bin/keybridge-rmlic-ready 30",timeout:40) }
+        }
+        try health()
+    }
+
+    private func armRuntimeObservers(_ generation:URL) throws {
+        if let subscribeRuntimeChanges { try subscribeRuntimeChanges(generation);return }
+        if qmpTransport == nil { _ = try qmp("query-status",observe:true) }
+        try armServiceObserver(generation)
+    }
+
+    /// Called on the serialized executor, including before expected shutdown.
+    private func stopQMPObserver() {
+        qmpLock.lock();defer { qmpLock.unlock() }
+        if let fd=observedQMP { Darwin.shutdown(fd,SHUT_RDWR) }
+        qmpObserver?.cancel();qmpObserver=nil;observedQMP=nil
+        qmpReadBuffer.removeAll();qmpObservationLost=false
+    }
+
+    /// The QMP chardev has one client. Reuse its connection for commands and
+    /// consume asynchronous frames only while no command owns the read lock.
+    private func observeQMP(_ fd:Int32) {
+        let source=DispatchSource.makeReadSource(fileDescriptor:fd,queue:DispatchQueue.global(qos:.utility))
+        source.setCancelHandler { Darwin.close(fd) }
+        source.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.qmpLock.lock()
+            guard self.observedQMP==fd,self.qmpObserver?.isCancelled == false else { self.qmpLock.unlock();return }
+            var bytes=[UInt8](repeating:0,count:16384)
+            let count=Darwin.read(fd,&bytes,bytes.count)
+            var lost=false
+            if count>0 {
+                self.qmpReadBuffer.append(contentsOf:bytes.prefix(count))
+                if let newline=self.qmpReadBuffer.lastIndex(of:10) { self.qmpReadBuffer.removeSubrange(...newline) }
+                lost=self.qmpReadBuffer.count>2*1024*1024
+            } else if count==0 || (errno != EAGAIN && errno != EINTR) { lost=true }
+            if lost {
+                self.qmpObservationLost=true
+                self.qmpObserver?.cancel();self.qmpObserver=nil;self.observedQMP=nil
+                self.qmpReadBuffer.removeAll()
+            }
+            self.qmpLock.unlock()
+            if lost { self.runtimeChanged?() }
+        }
+        observedQMP=fd;qmpObserver=source
+        source.resume()
+    }
+
+    /// A blocking guest pidfd subscription detects exits without periodic checks.
+    /// The SSH process also ends when the VM or its channel disappears.
+    private func armServiceObserver(_ generation:URL) throws {
+        if let observer=serviceObserver,!observer.isRunning { serviceObserver=nil }
+        guard guestTransport == nil,serviceObserver == nil else { return }
+        let script=try Data(contentsOf:resources.appendingPathComponent("guest/health.py"))
+        let process=Process(),input=Pipe(),output=Pipe(),errors=Pipe()
+        process.executableURL=URL(fileURLWithPath:"/usr/bin/ssh")
+        process.arguments=sshOptions(generation)+["sudo -n python3 - --watch-services"]
+        process.standardInput=input;process.standardOutput=output;process.standardError=errors
+        process.terminationHandler={ [weak self] _ in self?.runtimeChanged?() }
+        try process.run()
+        try output.fileHandleForWriting.close()
+        try errors.fileHandleForWriting.close()
+        let errorFD=errors.fileHandleForReading.fileDescriptor
+        _ = fcntl(errorFD,F_SETFL,O_NONBLOCK)
+        func failure(_ reason:String)->VMEngineError {
+            var bytes=[UInt8](repeating:0,count:2048)
+            let count=Darwin.read(errorFD,&bytes,bytes.count)
+            let detail=count>0 ? String(decoding:bytes.prefix(count),as:UTF8.self).trimmingCharacters(in:.whitespacesAndNewlines) : ""
+            return .channel(reason + (detail.isEmpty ? "" : ": " + detail))
+        }
+        var armed=false
+        defer {
+            if !armed { process.terminationHandler=nil; if process.isRunning { process.terminate() } }
+        }
+        try input.fileHandleForWriting.write(contentsOf:script)
+        try input.fileHandleForWriting.close()
+        let fd=output.fileHandleForReading.fileDescriptor
+        _ = fcntl(fd,F_SETFL,O_NONBLOCK)
+        // Real service recovery can delay this handshake beyond 10 seconds.
+        // Use the same finite bound as ordinary guest commands.
+        let deadline=ProcessInfo.processInfo.systemUptime + 40
+        var line=Data(),byte:UInt8=0
+        while line.count<4096 {
+            try checkCancellation()
+            guard ProcessInfo.processInfo.systemUptime<deadline else { throw failure("Истёк срок подтверждения подписки на события служб") }
+            var descriptor=pollfd(fd:fd,events:Int16(POLLIN),revents:0)
+            if Darwin.poll(&descriptor,1,50)<=0 { continue }
+            let count=Darwin.read(fd,&byte,1)
+            if count<0 && (errno==EAGAIN || errno==EINTR) { continue }
+            guard count==1 else { throw failure("Наблюдатель служб завершился до подтверждения подписки") }
+            if byte==10 { break };line.append(byte)
+        }
+        guard let result=(try?JSONSerialization.jsonObject(with:line)) as? [String:Any] else { throw VMEngineError.channel("Неизвестный ответ наблюдателя служб") }
+        if let failed=result["failedServices"] as? [String],!failed.isEmpty { throw VMEngineError.services(failed) }
+        guard result["watching"] as? Bool == true else { throw VMEngineError.channel("Наблюдатель служб не подтвердил подписку") }
+        serviceObserver=process
+        armed=true
+    }
+
+    /// Reuses all safety observations in one guest interpreter/SSH connection.
+    /// A steady observation never repeats capture or waits for hotplug delivery.
+    private func observeAttachedKey(_ generation: URL, wait: TimeInterval) throws {
+        guard let captured=capturedUSB else { throw VMEngineError.safety("Подключение ключа не подтверждено") }
+        func requireSameUSB() throws {
+            let connections: [USBConnection]
+            do { connections=try currentUSBConnections() }
+            catch { throw VMEngineError.safety("Наблюдение USB недоступно") }
+            guard connections.count <= 1 else { throw VMEngineError.safety("Найдено несколько ключей") }
+            guard connections == [captured] else { throw VMEngineError.message("Подключение USB изменилось; ожидается новое событие") }
+        }
+        try requireSameUSB()
+        let deadline=Date().addingTimeInterval(wait)
+        while true {
+            try checkCancellation()
+            let result=try guestObservation(generation)
+            guard result["status"] as? String == "ok",result["no_auto_fwup"] as? String == "1",
+                  let keys=result["keys"] as? [[String:Any]],keys.count<=1 else {
+                throw VMEngineError.safety("Защита прошивки или сведения о ключе не подтверждены")
+            }
+            try requireSameUSB()
+            if let failed=result["failedServices"] as? [String], !failed.isEmpty { throw VMEngineError.services(failed) }
+            let tree=try qmp("human-monitor-command",["command-line":"info qtree"]) as? String ?? ""
+            guard USBTransfer.matches(tree,connection:captured) else { throw VMEngineError.safety("QMP не подтверждает выбранное подключение ключа") }
+            if keys.count==1,result["services"] as? Bool == true,result["managerReady"] as? Bool == true,result["hotplug"] as? Bool == true {
+                update(["status":"running","phase":"ready","running":true,"message":"Менеджер доступен. Проверьте получение лицензии в 1С.","keyConnected":true,"usbTransition":"captured","safetyReasonCode":NSNull(),"keyModel":keys[0]["typename"] ?? "Sentinel HL","keyType":"Локальный USB","firmware":keys[0]["firmware"] ?? "","keyConnection":captured.descriptor,"lastError":NSNull()])
+                return
+            }
+            guard Date()<deadline else { throw VMEngineError.message("Драйвер, ключ или менеджер лицензий не подтвердили готовность") }
+            Thread.sleep(forTimeInterval:0.5)
         }
     }
 
@@ -659,7 +926,7 @@ public final class VMEngine {
             update(["status":"stopped","phase":"ready","ownership":"absent","busy":false,"running":false,"keyConnected":false,"usbReleased":true,"message":"Раздача остановлена","lastProbe":NSNull()])
         } catch {
             let observation = observeProcesses(runtime)
-            update(["status":"error","ownership":observation.name,"busy":false,"running":observation.identity != nil,"usbReleased":NSNull(),"lastProbe":NSNull(),"message":error.localizedDescription,"lastError":error.localizedDescription])
+            update(["status":"error","ownership":observation.name,"busy":false,"running":observation.running,"usbReleased":NSNull(),"lastProbe":NSNull(),"message":error.localizedDescription,"lastError":error.localizedDescription])
             throw error
         }
     }
@@ -671,13 +938,13 @@ public final class VMEngine {
         case .absent:
             update(["status":"stopped","ownership":"absent","busy":false,"running":false,"usbReleased":true,"lastProbe":NSNull()])
         case .unknown(let reason):
-            update(["status":"error","ownership":"unknown","busy":false,"usbReleased":NSNull(),"message":reason,"lastProbe":NSNull()])
+            update(["status":"error","ownership":"unknown","busy":false,"running":NSNull(),"usbReleased":NSNull(),"message":reason,"lastProbe":NSNull()])
         case .owned(let identity, _, _):
             try? identity.signal(SIGTERM)
             for _ in 0..<10 { if observeProcesses(runtime).isAbsent { break }; pause(0.1) }
             if !observeProcesses(runtime).isAbsent { try? identity.signal(SIGKILL) }
             let final = observeProcesses(runtime)
-            update(["status":final.isAbsent ? "stopped":"error","ownership":final.name,"busy":false,"running":final.identity != nil,"usbReleased":final.isAbsent ? true : NSNull(),"lastProbe":NSNull()])
+            update(["status":final.isAbsent ? "stopped":"error","ownership":final.name,"busy":false,"running":final.running,"usbReleased":final.isAbsent ? true : NSNull(),"lastProbe":NSNull()])
         }
     }
 
@@ -690,17 +957,27 @@ public final class VMEngine {
     }
 
     private func stoppedCleanup() {
+        stopQMPObserver()
+        serviceObserver?.terminationHandler=nil; serviceObserver?.terminate(); serviceObserver=nil
         child=nil; ownedGeneration=nil;capturedUSB=nil
         update(["usbTransition":"released","keyConnected":false])
         try? fm.removeItem(at:runtime.appendingPathComponent("active-vm.json"))
     }
 
     private func stopVM() throws {
+        // Establish ownership before terminating our SSH observer. During its
+        // exit macOS can transiently withhold its path and process metadata.
         let observation = observeProcesses(runtime)
         guard case .owned(let identity, let generation, _) = observation else {
             if observation.isAbsent { stoppedCleanup(); return }
+            if case .unknown(let reason) = observation {
+                throw VMEngineError.message("Остановка не подтверждена: " + reason)
+            }
             throw VMEngineError.message("Остановка не подтверждена: принадлежность VM неизвестна")
         }
+        stopQMPObserver()
+        child?.terminationHandler=nil
+        serviceObserver?.terminationHandler=nil; serviceObserver?.terminate(); serviceObserver=nil
         update(["usbTransition":"releasing","keyConnected":NSNull(),"lastProbe":NSNull()])
         // Shutdown must not depend on engine/preparation log writes. Disk full
         // can disable SSH's temporary output too; QMP and audit-token escalation
@@ -710,13 +987,13 @@ public final class VMEngine {
             if let shutdownGuest { shutdownGuest(folder) }
             else { _ = try? hostCommand("/usr/bin/ssh", sshOptions(folder) + ["sudo poweroff"], timeout:8) }
         }
-        _ = try? qmp("system_powerdown")
+        _ = try? qmp("system_powerdown", cancellable:false)
         for _ in 0..<40 {
             if observeProcesses(runtime).isAbsent { stoppedCleanup(); return }
             pause(0.5)
         }
         try? Data("Unclean guest shutdown; inspect on next start.\n".utf8).write(to:runtime.appendingPathComponent("dirty-shutdown"),options:.atomic)
-        _ = try? qmp("quit")
+        _ = try? qmp("quit", cancellable:false)
         pause(0.2)
         if !observeProcesses(runtime).isAbsent { try? identity.signal(SIGTERM); pause(0.5) }
         if !observeProcesses(runtime).isAbsent { try? identity.signal(SIGKILL); pause(0.2) }
@@ -728,50 +1005,116 @@ public final class VMEngine {
 
     private func ownPID() -> pid_t? { observeProcesses(runtime).identity?.pid }
 
-    private func checkPort(_ port: Int) throws {
-        let fd=Darwin.socket(AF_INET,SOCK_STREAM,0);guard fd>=0 else {throw VMEngineError.message("Не удалось проверить локальный порт.")};defer{Darwin.close(fd)}
+    func checkPort(_ port: Int, datagram:Bool = false) throws {
+        let fd=Darwin.socket(AF_INET,datagram ? SOCK_DGRAM:SOCK_STREAM,0);guard fd>=0 else {throw VMEngineError.message("Не удалось проверить локальный порт.")};defer{Darwin.close(fd)}
+        // Match QEMU's listener: closed connections may remain in TIME_WAIT
+        // after a normal stop without another listener owning the endpoint.
+        var reuse:Int32=1
+        guard datagram || setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&reuse,socklen_t(MemoryLayout<Int32>.size))==0 else {
+            throw VMEngineError.message("Не удалось проверить локальный порт.")
+        }
         var address=sockaddr_in();address.sin_len=UInt8(MemoryLayout<sockaddr_in>.size);address.sin_family=sa_family_t(AF_INET);address.sin_port=in_port_t(port).bigEndian;address.sin_addr=in_addr(s_addr:inet_addr("127.0.0.1"))
         let result=withUnsafePointer(to:&address){$0.withMemoryRebound(to:sockaddr.self,capacity:1){Darwin.bind(fd,$0,socklen_t(MemoryLayout<sockaddr_in>.size))}}
         guard result==0 else {throw VMEngineError.message("Локальный порт \(port) уже используется.")}
     }
 
-    private func qmp(_ command: String,_ arguments:[String:Any]=[:]) throws -> Any {
-        if let qmpTransport { return try qmpTransport(command, arguments) }
-        guard ownPID() != nil else {throw VMEngineError.message("VM недоступна.")}
-        let fd=Darwin.socket(AF_UNIX,SOCK_STREAM,0);guard fd>=0 else {throw VMEngineError.message("Не удалось создать канал QMP.")};defer{Darwin.close(fd)}
-        var seconds=timeval(tv_sec:8,tv_usec:0);setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&seconds,socklen_t(MemoryLayout<timeval>.size));setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&seconds,socklen_t(MemoryLayout<timeval>.size))
-        var noSignal:Int32=1;setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&noSignal,socklen_t(MemoryLayout<Int32>.size))
+    func qmp(_ command: String,_ arguments:[String:Any]=[:],cancellable:Bool=true,observe:Bool=false) throws -> Any {
+        let deadline=ProcessInfo.processInfo.systemUptime + qmpTimeout
+        func checkpoint() throws {
+            if cancellable { try checkCancellation() }
+            guard ProcessInfo.processInfo.systemUptime < deadline else { throw VMEngineError.qmp("Истёк срок ответа QMP") }
+        }
+        try checkpoint()
+        if let qmpTransport {
+            do { let result=try qmpTransport(command,arguments);try checkpoint();return result }
+            catch let error as VMEngineError {
+                if case .cancelled=error { throw error }
+                throw VMEngineError.qmp(error.localizedDescription)
+            }
+            catch { throw VMEngineError.qmp(error.localizedDescription) }
+        }
+        qmpLock.lock();defer { qmpLock.unlock() }
+        guard !qmpObservationLost else { throw VMEngineError.qmp("Прервано наблюдение канала QMP; требуется освобождение USB") }
+        guard ownPID() != nil else { throw VMEngineError.qmp("VM недоступна") }
+        let reused=observedQMP != nil
+        let fd=observedQMP ?? Darwin.socket(AF_UNIX,SOCK_STREAM,0)
+        guard fd>=0 else { throw VMEngineError.qmp("Не удалось создать канал QMP") }
+        var completed=false,retained=reused
+        defer {
+            if reused && !completed {
+                qmpObserver?.cancel();qmpObserver=nil;observedQMP=nil
+                qmpReadBuffer.removeAll();qmpObservationLost=true
+            } else if !retained { Darwin.close(fd) }
+        }
+        _ = fcntl(fd,F_SETFL,O_NONBLOCK)
+        var noSignal:Int32=1
+        setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&noSignal,socklen_t(MemoryLayout<Int32>.size))
+        func ready(_ events:Int16) throws {
+            while true {
+                try checkpoint()
+                var descriptor=pollfd(fd:fd,events:events,revents:0)
+                let available=Darwin.poll(&descriptor,1,50)
+                if available>0 {
+                    guard descriptor.revents & Int16(POLLERR|POLLNVAL) == 0 else { throw VMEngineError.qmp("Ошибка канала QMP") }
+                    return
+                }
+                if available<0 && errno != EINTR { throw VMEngineError.qmp("Ошибка ожидания QMP") }
+            }
+        }
+        if !reused {
         var address=sockaddr_un();address.sun_family=sa_family_t(AF_UNIX)
         let bytes=Array(qmpPath.path.utf8)+[0]
-        guard bytes.count<=MemoryLayout.size(ofValue:address.sun_path) else {throw VMEngineError.message("Слишком длинный путь QMP.")}
-        withUnsafeMutableBytes(of:&address.sun_path){$0.copyBytes(from:bytes)}
-        let connected=withUnsafePointer(to:&address){$0.withMemoryRebound(to:sockaddr.self,capacity:1){Darwin.connect(fd,$0,socklen_t(MemoryLayout<sockaddr_un>.size))}}
-        guard connected==0 else {throw VMEngineError.message("Канал управления VM недоступен.")}
-        func receive() throws -> [String:Any] {
-            var data=Data();var byte:UInt8=0
-            while data.count<2*1024*1024 {
-                guard Darwin.read(fd,&byte,1)==1 else {throw VMEngineError.message("VM не отвечает на команду управления.")}
-                if byte==10 { return (try JSONSerialization.jsonObject(with:data)) as? [String:Any] ?? [:] };data.append(byte)
-            }
-            throw VMEngineError.message("Слишком большой ответ QMP.")
+        guard bytes.count<=MemoryLayout.size(ofValue:address.sun_path) else { throw VMEngineError.qmp("Слишком длинный путь QMP") }
+        withUnsafeMutableBytes(of:&address.sun_path){ $0.copyBytes(from:bytes) }
+        let connected=withUnsafePointer(to:&address){ $0.withMemoryRebound(to:sockaddr.self,capacity:1){ Darwin.connect(fd,$0,socklen_t(MemoryLayout<sockaddr_un>.size)) } }
+        if connected != 0 {
+            guard errno == EINPROGRESS else { throw VMEngineError.qmp("Канал управления VM недоступен") }
+            try ready(Int16(POLLOUT))
+            var error:Int32=0,length=socklen_t(MemoryLayout<Int32>.size)
+            guard getsockopt(fd,SOL_SOCKET,SO_ERROR,&error,&length)==0,error==0 else { throw VMEngineError.qmp("Не удалось подключиться к QMP") }
         }
-        _ = try receive()
+        }
+        func receive() throws -> [String:Any] {
+            var data=qmpReadBuffer,byte:UInt8=0
+            qmpReadBuffer.removeAll()
+            while data.count<2*1024*1024 {
+                try ready(Int16(POLLIN))
+                let count=Darwin.read(fd,&byte,1)
+                if count<0 && (errno==EAGAIN || errno==EINTR) { continue }
+                guard count==1 else { throw VMEngineError.qmp("VM закрыла канал QMP") }
+                if byte==10 {
+                    guard let object=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any] else { throw VMEngineError.qmp("Некорректный ответ QMP") }
+                    return object
+                }
+                data.append(byte)
+            }
+            throw VMEngineError.qmp("Слишком большой ответ QMP")
+        }
+        if !reused { _ = try receive() }
         var result:Any=[:]
         for (identifier,operation) in ["qmp_capabilities",command].enumerated() {
+            if reused && identifier==0 { continue }
             let request:[String:Any]=["execute":operation,"arguments":identifier==0 ? [:]:arguments,"id":identifier]
             var payload=try JSONSerialization.data(withJSONObject:request);payload.append(10)
             try payload.withUnsafeBytes { buffer in
                 var sent=0
-                while sent<buffer.count { let count=Darwin.write(fd,buffer.baseAddress!.advanced(by:sent),buffer.count-sent);guard count>0 else {throw VMEngineError.message("Ошибка отправки команды VM.")};sent+=count }
+                while sent<buffer.count {
+                    try ready(Int16(POLLOUT))
+                    let count=Darwin.write(fd,buffer.baseAddress!.advanced(by:sent),buffer.count-sent)
+                    if count<0 && (errno==EAGAIN || errno==EINTR) { continue }
+                    guard count>0 else { throw VMEngineError.qmp("Ошибка отправки QMP") }
+                    sent+=count
+                }
             }
             while true {
                 let response=try receive()
-                guard response["id"] as? Int==identifier else {continue}
-                if let error=response["error"] as? [String:Any] {throw VMEngineError.message("VM отклонила команду: \(error["desc"] as? String ?? operation)")}
+                guard response["id"] as? Int == identifier else { continue }
+                if let error=response["error"] as? [String:Any] { throw VMEngineError.qmp("VM отклонила команду: \(error["desc"] as? String ?? operation)") }
                 result=response["return"] ?? [:];break
             }
         }
+        if observe && !reused { observeQMP(fd);retained=true }
+        completed=true
         return result
     }
-
 }

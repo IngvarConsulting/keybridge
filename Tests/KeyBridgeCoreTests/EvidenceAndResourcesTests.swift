@@ -3,6 +3,35 @@ import XCTest
 @testable import KeyBridgeCore
 
 final class EvidenceAndResourcesTests:XCTestCase {
+    func testCreationFailureSurvivesPresentationUntilRunChanges() throws {
+        for (code, timeout, expected): (Int32, Bool, String) in [(0, true, "timeout"), (1, false, "failure")] {
+            let probe = try XCTUnwrap(LicenseEvidence.creationFailure(exitCode: code, timedOut: timeout,
+                context: ["generation": "prepared", "run": "current-run"]))
+            var status: [String: Any] = ["status": "running", "running": true, "prepared": true,
+                "ownership": "owned", "keyConnected": true, "clientState": "configured",
+                "generation": "prepared", "runID": "current-run", "lastProbe": probe]
+            let current = AppPresentation.snapshot(status: status)["state"] as? [String: Any]
+            XCTAssertEqual(current?["proof"] as? String, expected)
+            XCTAssertEqual(current?["phase"] as? String, "ready")
+            XCTAssertEqual(probe["success"] as? Bool, false)
+            status["runID"] = "another-run"
+            let changed = AppPresentation.snapshot(status: status)["state"] as? [String: Any]
+            XCTAssertEqual(changed?["proof"] as? String, "stale")
+        }
+        XCTAssertNil(LicenseEvidence.creationFailure(exitCode: 0, timedOut: false, context: [:]))
+    }
+
+    func testSuccessfulClientWithoutNewLicenseEventsIsUnconfirmedNotFailure() {
+        let outcome = LicenseEvidence.probeOutcome(clientSucceeded: true, timedOut: false)
+        let payload = AppPresentation.snapshot(status: ["status": "running", "running": true,
+            "prepared": true, "ownership": "owned", "keyConnected": true, "clientState": "configured",
+            "lastProbe": ["result": outcome, "clientOperationSucceeded": true,
+                "managerIssuanceDelta": 0, "hardwareLocalDelta": 0]])
+        XCTAssertEqual((payload["state"] as? [String: Any])?["proof"] as? String, "unconfirmed")
+        XCTAssertEqual(LicenseEvidence.probeOutcome(clientSucceeded: false, timedOut: true), "timeout")
+        XCTAssertEqual(LicenseEvidence.probeOutcome(clientSucceeded: false, timedOut: false), "failure")
+    }
+
     func testRotationResetMissingAndChangedPrefixInvalidateContinuity() {
         let source:[String:Any]=["name":"fixture","inode":UInt64(123),"bytes":4096,"digest":"wholeOriginal","baselineDigest":"wholeOriginal"]
         let before:[String:Any]=["available":true,"sources":[source]]

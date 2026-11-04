@@ -4,6 +4,20 @@ import XCTest
 @testable import KeyBridgeCore
 
 final class ImportArchiveTests: XCTestCase {
+    func testResolvedDriverReusesValidationButRejectsChangedOrMissingSnapshot() throws {
+        try withFolder { root in
+            let input=root.appendingPathComponent("driver.deb")
+            try ImportFixture.deb().write(to:input)
+            let candidate=try XCTUnwrap(ImportArchive.resolve(input,kind:"driver",directory:root.appendingPathComponent("result")).first)
+            XCTAssertEqual(try candidate.validation(kind:"driver")?["validation"] as? String,"complete")
+            let result=try ImportInspection.inspect(candidate,kind:"driver",resources:root,workspace:root)
+            XCTAssertEqual(result["valid"] as? Bool,true)
+            try ImportFixture.deb(architecture:"arm64").write(to:candidate.file,options:.atomic)
+            XCTAssertThrowsError(try ImportInspection.inspect(candidate,kind:"driver",resources:root,workspace:root))
+            try FileManager.default.removeItem(at:candidate.file)
+            XCTAssertThrowsError(try candidate.validation(kind:"driver"))
+        }
+    }
     private func withFolder(_ body: (URL) throws -> Void) throws {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("kb-import-tests-" + UUID().uuidString)
         try BridgePaths.preparePrivateDirectory(folder)

@@ -5,6 +5,16 @@ import Darwin
 @testable import KeyBridgeCore
 
 final class OperationJournalTests:XCTestCase {
+    func testAcceptedQueuedCommandIsNotReplayedAfterAgentRestart() throws {
+        let runtime=FileManager.default.temporaryDirectory.appendingPathComponent("kb-queued-"+UUID().uuidString)
+        try BridgePaths.preparePrivateDirectory(runtime);defer { try?FileManager.default.removeItem(at:runtime) }
+        let journal=OperationJournal(runtime:runtime),id=UUID().uuidString
+        try journal.receive(id:id,action:"probe")
+        XCTAssertEqual(readObject(runtime.appendingPathComponent("operations/"+id+".json"))["state"] as? String,"accepted")
+        let recovered=OperationJournal(runtime:runtime).recover()
+        XCTAssertEqual(recovered[id]?["resultState"] as? String,"unknown")
+        XCTAssertEqual(recovered[id]?["ok"] as? Bool,false)
+    }
     var runtime:URL!
     override func setUpWithError() throws {
         runtime=URL(fileURLWithPath:"/tmp").appendingPathComponent("kb-"+UUID().uuidString)
@@ -79,7 +89,7 @@ final class OperationJournalTests:XCTestCase {
         try store.setAutostart(false,supported:false)
         let reloaded=try IntentStore(runtime:runtime)
         XCTAssertFalse(reloaded.value.autostart)
-        XCTAssertTrue(reloaded.value.autoInhibit)
+        XCTAssertTrue(reloaded.value.inhibited)
     }
     func testBudgetIsConsumedAndFailureDoesNotReplenishIt() throws {
         let store=try IntentStore(runtime:runtime);try store.start()
@@ -136,7 +146,7 @@ final class OperationJournalTests:XCTestCase {
         XCTAssertEqual(try CommandQueue.enqueue(["action":"start","requestID":id],runtime:runtime),id)
         XCTAssertEqual(try CommandQueue.take(runtime:runtime).first?.0,id)
     }
-    func testPeriodicReconciliationRetainsOneRecordWithUniqueOperationTokens() throws {
+    func testEventReconciliationRetainsOneRecordWithUniqueOperationTokens() throws {
         let journal=OperationJournal(runtime:runtime)
         var ids=Set<String>()
         for _ in 0..<10 {
@@ -155,6 +165,62 @@ final class OperationJournalTests:XCTestCase {
         let recovered=OperationJournal(runtime:runtime).recover()
         XCTAssertEqual(recovered[id]?["ok"] as? Bool,true)
         XCTAssertEqual(recovered[id]?["resultState"] as? String,"finished")
+    }
+
+    func testSafetyCauseSurvivesStopAutostartAndRestartUntilVerification() throws {
+        let store=try IntentStore(runtime:runtime)
+        try store.start();try store.hold("firmware-unknown");try store.stop()
+        try store.setAutostart(true,supported:true)
+        let restored=try IntentStore(runtime:runtime)
+        XCTAssertEqual(restored.value.safetyReason,"firmware-unknown")
+        XCTAssertTrue(restored.value.inhibited)
+        try restored.start()
+        XCTAssertTrue(restored.value.inhibited,"The start request is not proof of safety")
+        try restored.clearSafetyAfterVerification()
+        XCTAssertFalse(try IntentStore(runtime:runtime).value.inhibited)
+    }
+    func testSavedIntentModificationIsNotSilentlyTrusted() throws {
+        let store=try IntentStore(runtime:runtime);try store.start()
+        try store.validateSaved()
+        try Data("broken".utf8).write(to:runtime.appendingPathComponent("intent.json"),options:.atomic)
+        XCTAssertThrowsError(try store.validateSaved())
+        XCTAssertTrue(store.value.want)
+    }
+    func testOldCombinedInhibitDoesNotLoseUnknownSafetyCause() throws {
+        try writeObject(["schema":1,"want":false,"autoInhibit":true,"autostart":true,"remaining":2,"sessionID":"old","revision":0],to:runtime.appendingPathComponent("intent.json"))
+        let store=try IntentStore(runtime:runtime)
+        try store.setAutostart(true,supported:true)
+        XCTAssertTrue(store.value.inhibited)
+        XCTAssertNotNil(store.value.safetyReason)
+    }
+    func testTerminalWriteFailureIsReturnedWithoutHoldingAdmission() throws {
+        let journal=OperationJournal(runtime:runtime)
+        let token=try journal.begin(id:UUID().uuidString,action:"start")
+        let path=runtime.appendingPathComponent("operations/"+token.id+".json")
+        try FileManager.default.removeItem(at:path)
+        try FileManager.default.createDirectory(at:path,withIntermediateDirectories:false)
+        XCTAssertNotNil(journal.finish(token,response:["ok":true]))
+        XCTAssertNoThrow(try journal.begin(id:UUID().uuidString,action:"stop",safety:true))
+    }
+    func testOnlyOneDiagnosticMayWaitAndNeverBehindStop() {
+        XCTAssertFalse(AgentAdmission.canWait(action:"start",active:"reconcile",pending:false,stopping:false))
+        XCTAssertTrue(AgentAdmission.canWait(action:"probe",active:"start",pending:false,stopping:false))
+        XCTAssertFalse(AgentAdmission.canWait(action:"probe",active:"start",pending:true,stopping:false))
+        XCTAssertFalse(AgentAdmission.canWait(action:"probe",active:"stop",pending:false,stopping:false))
+        XCTAssertFalse(AgentAdmission.canWait(action:"inspect",active:"prepare",pending:false,stopping:true))
+    }
+
+    func testFailedSafetySaveSurvivesPreferenceChangeOnceStorageRecovers() throws {
+        let store=try IntentStore(runtime:runtime);try store.start()
+        store.writeData={_,_ in throw BridgeError("disk full")}
+        XCTAssertThrowsError(try store.hold("multiple-keys"))
+        XCTAssertTrue(store.value.inhibited)
+        XCTAssertEqual(store.value.safetyReason,"multiple-keys")
+        store.writeData={try $0.write(to:$1,options:.atomic)}
+        try store.setAutostart(true,supported:true)
+        let restored=try IntentStore(runtime:runtime)
+        XCTAssertTrue(restored.value.inhibited)
+        XCTAssertEqual(restored.value.safetyReason,"multiple-keys")
     }
 
 }

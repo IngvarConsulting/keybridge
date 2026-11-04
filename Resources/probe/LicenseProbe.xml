@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" version="2.20">
+  <ExternalDataProcessor uuid="4eb43a13-a4c2-4f35-af91-599c951892a0">
+    <InternalInfo>
+      <xr:ContainedObject>
+        <xr:ClassId>c3831ec8-d8d5-4f93-8a22-f9bfae07327f</xr:ClassId>
+        <xr:ObjectId>74ca7c4a-2501-409f-8834-02cd18dab689</xr:ObjectId>
+      </xr:ContainedObject>
+      <xr:GeneratedType name="ExternalDataProcessorObject.LicenseProbe" category="Object">
+        <xr:TypeId>b0a511e6-b376-45a9-a091-c4977f34ed75</xr:TypeId>
+        <xr:ValueId>edc60451-1b42-4912-86fe-01a1de8b971f</xr:ValueId>
+      </xr:GeneratedType>
+    </InternalInfo>
+    <Properties>
+      <Name>LicenseProbe</Name>
+      <Synonym/>
+      <Comment/>
+      <DefaultForm>ExternalDataProcessor.LicenseProbe.Form.Probe</DefaultForm>
+      <AuxiliaryForm/>
+    </Properties>
+    <ChildObjects><Form>Probe</Form></ChildObjects>
+  </ExternalDataProcessor>
+</MetaDataObject>

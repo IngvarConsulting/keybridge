@@ -8,12 +8,13 @@ public enum ImportInspection {
     public static func inspect(_ candidate: ImportCandidate, kind: String, resources: URL,
                                workspace: URL, cancelled: @escaping () -> Bool = { false }) throws -> [String: Any] {
         if cancelled() { throw CancellationError() }
-        var result = try ImportValidation.inspect(candidate.file, kind: kind, cancelled: cancelled)
+        var result = try candidate.validation(kind:kind) ?? ImportValidation.inspect(candidate.file, kind: kind, cancelled: cancelled)
         if kind == "installer" {
             result = try InstallerPreflight.inspect(candidate.file, resources: resources,
                                                     workspace: workspace, cancelled: cancelled)
         }
         if cancelled() { throw CancellationError() }
+        try candidate.requireUnchanged()
         guard result["valid"] as? Bool == true else {
             throw BridgeError("Пригодность файла не подтверждена. Выберите другой файл и повторите проверку.")
         }

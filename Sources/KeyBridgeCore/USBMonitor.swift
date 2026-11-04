@@ -54,7 +54,7 @@ public final class USBMonitor {
                 var timeout=timeval(tv_sec:0,tv_usec:100_000)
                 let result=events(context,&timeout,nil)
                 if result<0 && result != -10 {
-                    lock.lock();failure="Потерян наблюдатель USB: \(result)";lock.unlock();return
+                    lock.lock();failure="Потерян наблюдатель USB: \(result)";lock.unlock();changed();return
                 }
             }
         }

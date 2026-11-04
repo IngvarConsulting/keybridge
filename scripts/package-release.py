@@ -37,18 +37,17 @@ def run(*args: str | Path) -> None:
     subprocess.run([str(arg) for arg in args], check=True)
 
 
-def load_auditor():
-    spec = importlib.util.spec_from_file_location("keybridge_archive", ROOT / "scripts/source-archive.py")
+def load_script(name):
+    spec = importlib.util.spec_from_file_location("keybridge_" + name.replace("-", "_"), ROOT / "scripts" / (name + ".py"))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-def load_source_links():
-    spec = importlib.util.spec_from_file_location("keybridge_source_links", ROOT / "scripts/component-sources.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def is_adhoc_signed(app: Path) -> bool:
+    result = subprocess.run(["/usr/bin/codesign", "--display", "--verbose=2", str(app)],
+                            text=True, capture_output=True)
+    return result.returncode == 0 and "Signature=adhoc" in result.stderr.splitlines()
 
 
 def instructions(version: str) -> str:
@@ -62,8 +61,8 @@ def instructions(version: str) -> str:
    «Конфиденциальность и безопасность» и разрешите открытие KeyBridge.
    Это предварительный выпуск без Developer ID и нотариализации Apple.
    Инструкция Apple: https://support.apple.com/102445
-4. Выберите в KeyBridge свои установщики: полный дистрибутив 1С для Linux
-   x86-64 (.run) и драйвер HASP aksusbd для Debian/Ubuntu amd64 (.deb).
+4. Выберите в KeyBridge свои установщики: полную поставку 1С 8.5.4 или новее
+   для Linux x86-64 (.run) с rmlic и драйвер HASP aksusbd для Debian/Ubuntu amd64 (.deb).
    Можно выбрать скачанные ZIP/tar-архивы без ручной распаковки.
    KeyBridge проверит компоненты сразу после выбора, до установки.
    Проверка установщика 1С может занять около двух минут; её можно отменить.
@@ -71,9 +70,11 @@ def instructions(version: str) -> str:
 5. Подключите USB-ключ. Клиент 1С для macOS должен быть установлен отдельно.
 
 Homebrew, Docker и Python на вашем Mac не нужны.
-Запуск KeyBridge при входе в систему в этой сборке недоступен.
-Автоматическая проверка пока не подтверждает, что именно её запуск 1С
-получил аппаратную лицензию. Проверяйте работу в своей базе 1С.
+Запуск KeyBridge при входе в систему включается в настройках приложения.
+Выход и новый вход в macOS с включённым автозапуском ещё не проверены.
+Для 1С 8.5.4 и новее автоматическая проба подтверждает аппаратную лицензию,
+если удаётся связать её с проверяемым процессом и менеджером KeyBridge.
+Для старой 1С отдельный HASP License Manager в поставку не входит.
 
 Код и скрипты сборки опубликованы в репозитории KeyBridge:
 https://github.com/IngvarConsulting/keybridge/tree/v{version}
@@ -81,7 +82,10 @@ https://github.com/IngvarConsulting/keybridge/tree/v{version}
 на странице выпуска:
 https://github.com/IngvarConsulting/keybridge/releases/tag/v{version}
 
-Если заменяете прежнюю сборку, сначала выберите в ней «Выключить и выйти».
+При обновлении с beta.3 или более ранней сборки, если она меняла поиск
+лицензии 1С, выключите раздачу и выберите в старой сборке «Вернуть настройки…».
+Затем выберите «Выключить и выйти» и замените приложение. Настройте поиск
+заново: новая сборка меняет общие rclic.cfg и nethasp.ini в /opt/1cv8/conf.
 Ваши установщики, настройки и рабочий диск хранятся отдельно от приложения.
 """
 
@@ -124,11 +128,11 @@ def boot_open_base(app: Path, directory: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--app", type=Path, required=True)
-    parser.add_argument("--version", required=True, help="Preview tag version, e.g. 0.1.0-beta.1")
+    parser.add_argument("--version", required=True, help="Preview tag version, e.g. 0.1.0-rc.1")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+-beta\.[1-9][0-9]*", args.version):
-        raise ValueError("This packager creates explicit beta releases only")
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+-(?:beta|rc)\.[1-9][0-9]*", args.version):
+        raise ValueError("Expected an explicit beta or release candidate version")
     app, output = args.app.expanduser().resolve(), args.output.expanduser().resolve()
     if output == ROOT or ROOT in output.parents or output.exists():
         raise ValueError("Output must be a new directory outside the repository")
@@ -137,23 +141,29 @@ def main() -> None:
         raise ValueError("Commit the reviewed release sources before packaging")
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+    if info.get("CFBundleIdentifier") != "pro.keybridge.pilot":
+        raise ValueError("Only the production application identity may be packaged for release")
     if (info["CFBundleShortVersionString"] != args.version.split("-", 1)[0]
             or info["LSMinimumSystemVersion"] != "27.0"
-            or info.get("KeyBridgeLoginLaunchSupported") is not False):
-        raise ValueError("Application version, minimum macOS or signing mode differs from preview instructions")
-    auditor = load_auditor()
+            or info.get("KeyBridgeLoginLaunchSupported") is not True or "LSEnvironment" in info):
+        raise ValueError("Application settings differ from preview instructions")
+    auditor = load_script("source-archive")
     audit = auditor.audit_app(app)
     if not audit["passed"]:
         raise ValueError("Application audit failed: " + json.dumps(audit))
     build = json.loads((app / "Contents/Resources/build-inventory.json").read_text())
-    for name, expected_hash in build["sources_sha256"].items():
-        if sha256(ROOT / name) != expected_hash:
-            raise ValueError("Application was built from different source: " + name)
+    if (build.get("signature") != "ad-hoc" or build.get("notarized") is not False
+            or not is_adhoc_signed(app)):
+        raise ValueError("Expected an ad-hoc signed preview")
+    builder = load_script("build-app")
+    expected = {path.relative_to(ROOT).as_posix(): sha256(path) for path in builder.production_source_paths()}
+    if build.get("compiled_from_sources") is not True or build.get("sources_sha256") != expected:
+        raise ValueError("Application was built from different sources or reused compiled binaries")
     for name in ("LICENSE", "THIRD_PARTY.md"):
         if (ROOT / name).read_bytes() != (app / "Contents/Resources" / name).read_bytes():
             raise ValueError("Bundled notice differs from published source: " + name)
     output.mkdir(parents=True)
-    sources = load_source_links().write_catalog(app, revision, output / "COMPONENT-SOURCES.md")
+    sources = load_script("component-sources").write_catalog(app, revision, output / "COMPONENT-SOURCES.md")
     stem = "KeyBridge-" + args.version
     dmg = output / (stem + "-macOS-arm64.dmg")
     with tempfile.TemporaryDirectory(prefix="keybridge-dmg-", dir=output.parent) as temporary:
@@ -194,7 +204,8 @@ def main() -> None:
               "component_sources": sources,
               "dmg_verified": True, "installed_copy_verified": True,
               "isolated_control_launch": True, "open_guest_boot_128_mib": True,
-              "hardware_license_tested": False, "signature": "ad-hoc", "notarized": False}
+              "hardware_license_tested": False, "login_session_tested": False,
+              "signature": "ad-hoc", "notarized": False}
     (output / "release-audit.json").write_text(json.dumps(report, indent=2) + "\n")
     artifacts = sorted(p for p in output.iterdir() if p.is_file())
     (output / "SHA256SUMS.txt").write_text("".join(f"{sha256(p)}  {p.name}\n" for p in artifacts))

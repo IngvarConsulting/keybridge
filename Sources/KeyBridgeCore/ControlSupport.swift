@@ -76,7 +76,7 @@ public func jsonText(_ object: [String: Any]) -> String {
 }
 public func shellQuote(_ string: String) -> String { "'" + string.replacingOccurrences(of: "'", with: "'\\''") + "'" }
 
-public struct HostCommandResult { public let code: Int32; public let output: String; public let timedOut: Bool }
+public struct HostCommandResult { public let code: Int32; public let output: String; public let timedOut: Bool; public let processID:Int32 }
 public func hostCommand(_ executable: String, _ args: [String], timeout: TimeInterval = 60, log: URL? = nil, cancellation: URL? = nil, isCancelled: (() -> Bool)? = nil, onPoll: (() throws -> Void)? = nil) throws -> HostCommandResult {
     let temp = log ?? FileManager.default.temporaryDirectory.appendingPathComponent("keybridge-command-\(UUID().uuidString).log")
     FileManager.default.createFile(atPath: temp.path, contents: nil, attributes: [.posixPermissions: 0o600])
@@ -98,7 +98,7 @@ public func hostCommand(_ executable: String, _ args: [String], timeout: TimeInt
     let output = (try? String(contentsOf: temp, encoding: .utf8)) ?? ""
     if log == nil { try? FileManager.default.removeItem(at: temp) }
     if let pollError { throw pollError }
-    return HostCommandResult(code: p.terminationStatus, output: String(output.suffix(16000)), timedOut: timedOut)
+    return HostCommandResult(code: p.terminationStatus, output: String(output.suffix(16000)), timedOut: timedOut, processID:p.processIdentifier)
 }
 
 public enum CommandQueue {

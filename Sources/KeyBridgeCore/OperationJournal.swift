@@ -67,6 +67,9 @@ public final class OperationJournal {
         return token
     }
     public func receiveSafety(id:String,action:String) throws {
+        try receive(id:id,action:action)
+    }
+    public func receive(id:String,action:String) throws {
         lock.lock();defer{lock.unlock()}
         try record(OperationToken(id:id,action:action,epoch:epoch),state:"accepted")
     }
@@ -83,24 +86,27 @@ public final class OperationJournal {
         guard active == token, epoch == token.epoch else { throw VMEngineError.cancelled }
         return try body()
     }
-    public func finish(_ token: OperationToken, response: [String:Any]) {
+    @discardableResult public func finish(_ token: OperationToken, response: [String:Any], beforePublishing: () -> Void = {}) -> String? {
         lock.lock(); defer { lock.unlock() }
-        do { try record(token, state:"finished", response:response) }
-        catch { persistenceError = error.localizedDescription }
         if active == token {
             if configurationWriter>=0 {
                 if (try?commitLock()) != nil { revokeConfiguration();flock(commitFD,LOCK_UN) }
                 else { revokeConfiguration() }
             }
             active = nil
+            // Release the agent's admission slot before any caller can observe
+            // the durable terminal response. Publication still owns this lock.
+            beforePublishing()
         }
+        do { try record(token, state:"finished", response:response);return nil }
+        catch { persistenceError = error.localizedDescription;return error.localizedDescription }
     }
     private func record(_ token:OperationToken,state:String,response:[String:Any]?=nil) throws {
         let folder=runtime.appendingPathComponent("operations")
         try BridgePaths.preparePrivateDirectory(folder)
         var value:[String:Any] = ["requestID":token.id,"action":token.action,"state":state,"updated":Date().timeIntervalSince1970]
         if let response { value["response"]=response }
-        // Periodic reconciliation has unique tokens but only its latest record
+        // Event reconciliation has unique tokens but only its latest record
         // needs retention. User requests keep individual durable outcomes.
         let destination=token.action == "reconcile" ? runtime.appendingPathComponent("reconciliation.json") : folder.appendingPathComponent(token.id + ".json")
         try writeObject(value,to:destination)
@@ -131,7 +137,9 @@ public final class OperationJournal {
 }
 
 public struct DesiredRuntime: Codable, Equatable {
-    public var schema = 1
+    public var schema = 2
+    public var safetyReason: String?
+    public var inhibited: Bool { autoInhibit || safetyReason != nil }
     public var want = false
     public var autoInhibit = false
     public var autostart = false
@@ -144,14 +152,26 @@ public final class IntentStore {
     private let lock=NSRecursiveLock()
     private let runtime:URL
     private var current:DesiredRuntime
+    private var pendingSafetyReason:String?
     var writeData:(Data,URL)throws->Void = { try $0.write(to:$1,options:.atomic) }
-    public var value:DesiredRuntime { lock.lock();defer{lock.unlock()};return current }
+    public var value:DesiredRuntime {
+        lock.lock();defer{lock.unlock()}
+        var observed=current
+        if let pendingSafetyReason {observed.safetyReason=pendingSafetyReason}
+        return observed
+    }
     public init(runtime:URL) throws {
         self.runtime=runtime
         let path=runtime.appendingPathComponent("intent.json")
         if FileManager.default.fileExists(atPath:path.path) {
             current=try JSONDecoder().decode(DesiredRuntime.self,from:Data(contentsOf:path))
-            guard current.schema == 1, (0...100).contains(current.remaining) else { throw BridgeError("Сохранённое намерение повреждено") }
+            guard [1,2].contains(current.schema), (0...100).contains(current.remaining) else { throw BridgeError("Сохранённое намерение повреждено") }
+            if current.schema == 1 {
+                // An old combined inhibit cannot prove the absence of a safety cause.
+                if current.autoInhibit { current.safetyReason="Причина прежнего запрета неизвестна; требуется явное включение с проверкой условий" }
+                current.schema=2
+                try persist(current)
+            }
         } else {
             let desired=readObject(runtime.appendingPathComponent("desired.json"))
             let preferences=readObject(runtime.appendingPathComponent("preferences.json"))
@@ -173,13 +193,29 @@ public final class IntentStore {
     }
     public func update(_ change:(inout DesiredRuntime)->Void) throws {
         lock.lock();defer{lock.unlock()}
-        var next=current; change(&next);next.revision &+= 1
-        try persist(next);current=next
+        var next=current
+        if let pendingSafetyReason {next.safetyReason=pendingSafetyReason}
+        change(&next);next.revision &+= 1
+        try persist(next);current=next;pendingSafetyReason=nil
     }
     public func start() throws { try update { $0.want=true;$0.autoInhibit=false;$0.remaining=3 } }
     public func stop() throws { try update { $0.want=false;$0.autoInhibit=true } }
     public func prepare() throws { try update { $0.want=false } }
-    public func hold() throws { try update { $0.autoInhibit=true } }
+    public func hold(_ reason:String = "Работа запрещена до проверки условий") throws {
+        lock.lock();defer{lock.unlock()}
+        pendingSafetyReason=reason
+        try update { $0.safetyReason=reason }
+    }
+    public func clearSafetyAfterVerification() throws { try update { $0.safetyReason=nil } }
+    public func validateSaved() throws {
+        lock.lock();defer{lock.unlock()}
+        let path=runtime.appendingPathComponent("intent.json")
+        var info=stat()
+        guard lstat(path.path,&info)==0,info.st_uid==getuid(),(info.st_mode&S_IFMT)==S_IFREG,
+              let saved=try?JSONDecoder().decode(DesiredRuntime.self,from:Data(contentsOf:path)), saved==current else {
+            throw BridgeError("Сохранённое разрешение работы изменено или повреждено")
+        }
+    }
     public func consumeAttempt() throws {
         try update { $0.remaining=max(0,$0.remaining-1) }
     }

@@ -3,6 +3,17 @@ import XCTest
 @testable import KeyBridgeCore
 
 final class AppPresentationTests: XCTestCase {
+    func testFreshSnapshotsExplicitlyClearPendingAndExposeOldAgent() {
+        XCTAssertEqual(state(running)["operationPending"] as? Bool, false)
+        var previous = running
+        previous["agentNeedsRestart"] = true
+        XCTAssertEqual(state(previous)["phase"] as? String, "agent-update")
+        previous["agentNeedsRestart"] = false
+        XCTAssertEqual(state(previous)["phase"] as? String, "ready")
+        previous["loginAccess"] = "unregistered"
+        XCTAssertEqual(state(previous)["permission"] as? String, "unregistered")
+    }
+
     func testAutostartCapabilityIsIndependentOfSavedChoiceAndOSPermission() {
         var observed=running
         observed["autostart"]=true
@@ -103,7 +114,7 @@ final class AppPresentationTests: XCTestCase {
         XCTAssertEqual(state(value)["phase"] as? String, "reconciling")
     }
 
-    func testSleepAndReconciliationDoNotRemoveStopOrRefreshProof() {
+    func testUnavailableSessionAndReconciliationDoNotRemoveStopOrRefreshProof() {
         var value = stopped; value["sessionActive"] = false
         value["lastProbe"] = ["result": "success", "success": true]
         XCTAssertEqual(state(value)["phase"] as? String, "paused")
@@ -112,6 +123,46 @@ final class AppPresentationTests: XCTestCase {
         value["sessionActive"] = true; value["reconciling"] = true
         XCTAssertEqual(state(value)["phase"] as? String, "reconciling")
         XCTAssertEqual(state(value)["want"] as? Bool, false)
+    }
+
+    func testSessionAvailabilityPreservesObservedReasonAndClearsMissingHistoricalReason() {
+        var value = stopped
+        value["sessionActive"] = false
+        XCTAssertEqual(state(value)["sessionAvailability"] as? String, "unavailable")
+        XCTAssertEqual(state(value)["sessionReason"] as? String, "")
+        for (availability, reason) in [("sleeping", "system-sleep"), ("unavailable", "session-off-console"),
+                                      ("unavailable", "login-incomplete"), ("unavailable", "observation-unavailable")] {
+            value["sessionAvailability"] = availability; value["sessionReason"] = reason
+            let projected = state(value)
+            XCTAssertEqual(projected["phase"] as? String, "paused")
+            XCTAssertEqual(projected["sessionAvailability"] as? String, availability)
+            XCTAssertEqual(projected["sessionReason"] as? String, reason)
+            XCTAssertEqual(projected["hold"] as? Bool, true)
+        }
+        value["sessionActive"] = true
+        value.removeValue(forKey: "sessionAvailability"); value.removeValue(forKey: "sessionReason")
+        XCTAssertEqual(state(value)["sessionAvailability"] as? String, "")
+        XCTAssertEqual(state(value)["sessionReason"] as? String, "")
+    }
+
+    func testInvalidRuntimeUsesOrdinaryErrorStateInsteadOfHistoricalReady() {
+        var value = running
+        value["runtimeDataError"] = "Данные повреждены. Восстановите их из резервной копии."
+        value["lastProbe"] = ["result": "success", "success": true]
+        let failed = state(value)
+        XCTAssertEqual(failed["phase"] as? String, "data-error")
+        XCTAssertEqual(failed["dataError"] as? String, value["runtimeDataError"] as? String)
+        XCTAssertEqual(failed["proof"] as? String, "stale")
+        value["busy"] = true; value["operation"] = "stop"
+        XCTAssertEqual(state(value)["phase"] as? String, "stopping", "A current safety Stop must remain visible even when stored data is invalid")
+        value["stale"] = true
+        XCTAssertEqual(state(value)["phase"] as? String, "data-error", "A historical Stop cannot stand in for current progress")
+        value.removeValue(forKey: "busy"); value.removeValue(forKey: "operation"); value.removeValue(forKey: "stale")
+        value.removeValue(forKey: "runtimeDataError")
+        let checked = state(value)
+        XCTAssertEqual(checked["dataError"] as? String, "")
+        XCTAssertEqual(checked["phase"] as? String, "ready")
+        XCTAssertNotEqual(failed["contextVersion"] as? String, checked["contextVersion"] as? String)
     }
 
     func testProbeFailureDoesNotTurnHealthyKeyBridgeIntoFailedStart() {
@@ -134,7 +185,7 @@ final class AppPresentationTests: XCTestCase {
     func testCausalProofMustMatchCurrentGenerationAndRun() {
         var value = running
         let evidence: [String: Any] = ["result": "success", "success": true, "clientOperationSucceeded": true,
-            "journalContinuous": true, "contextStable": true, "causalIsolation": true,
+            "journalContinuous": true, "contextStable": true, "causalIsolation": true, "evidenceMethod":"client-license-monitoring",
             "managerIssuanceDelta": 1, "hardwareLocalDelta": 1,
             "contextAfter": ["generation": "generation-a", "run": "run-a", "usb": "connection-a"]]
         value["lastProbe"] = evidence
@@ -263,12 +314,12 @@ final class AppPresentationTests: XCTestCase {
 
     func testImportFailuresTellWhichFileToReplaceAndDoNotRequireExactVersion() {
         let installer = AppPresentation.failureMessage(action: "installer", raw: "unreadable")
-        XCTAssertTrue(installer.contains("полную поставку для Linux x86-64"))
+        XCTAssertTrue(installer.contains("полную поставку платформы 1С 8.5.4 или новее для Linux x86-64"))
         XCTAssertTrue(installer.contains("выберите файл заново"))
         let manager = AppPresentation.failureMessage(action: "installer", raw: "lic_manager absent")
         XCTAssertTrue(manager.contains("не содержит нужный менеджер лицензий"))
-        XCTAssertTrue(manager.contains("Выберите другой установщик"))
-        XCTAssertFalse(manager.contains("полную поставку"))
+        XCTAssertTrue(manager.contains("8.5.4 или новее"))
+        XCTAssertTrue(manager.contains("полную поставку"))
         let driver = AppPresentation.failureMessage(action: "driver", raw: "unreadable")
         XCTAssertTrue(driver.contains("aksusbd для Linux amd64"))
         XCTAssertFalse(driver.contains("10.33"))
@@ -288,8 +339,8 @@ final class AppPresentationTests: XCTestCase {
             XCTAssertEqual(projected["phase"] as? String, "install-error")
             XCTAssertEqual(projected["installerIssue"] as? String, issue)
             let message = projected["errorMessage"] as? String ?? ""
-            XCTAssertTrue(message.contains("Выберите другой установщик 1С"))
-            XCTAssertFalse(message.contains("полную поставку"))
+            XCTAssertTrue(message.contains("8.5.4 или новее"))
+            XCTAssertTrue(message.contains("полную поставку"))
             XCTAssertFalse(message.contains("Повторите"))
             XCTAssertFalse(message.contains("/private"))
             value["lastFailure"] = NSNull()
@@ -374,4 +425,24 @@ final class AppPresentationTests: XCTestCase {
         XCTAssertTrue(AppPresentation.failureMessage(action: "check-space", raw: "no response").contains("Хранилище"))
         XCTAssertTrue(AppPresentation.failureMessage(action: "check-space", raw: "ENOSPC").contains("не хватает свободного места"))
     }
+    func testCausalReceiptWithReusedLicenseNeedsNoCounterGrowth() {
+        var value=running
+        let usb:[String:Any]=["epoch":"current-connection","bus":1,"address":2]
+        value["keyConnection"]=usb
+        value["lastProbe"]=["result":"success","success":true,"clientOperationSucceeded":true,
+            "causalIsolation":true,"contextStable":true,"evidenceMethod":"client-license-monitoring",
+            "managerIssuanceDelta":0,"hardwareLocalDelta":0,
+            "contextAfter":["generation":"generation-a","run":"run-a","usb":usb]]
+        XCTAssertEqual(state(value)["proof"] as? String,"success")
+        value["keyConnection"]=["epoch":"replacement","bus":1,"address":2]
+        XCTAssertEqual(state(value)["proof"] as? String,"unconfirmed")
+    }
+
+    func testGuestResourceFailureDoesNotBlameMacResources() {
+        let disk=AppPresentation.failureMessage(action:"prepare",raw:"Внутри Linux не хватает места для подготовки компонентов")
+        XCTAssertTrue(disk.contains("Linux"));XCTAssertFalse(disk.contains("На Mac"))
+        let memory=AppPresentation.failureMessage(action:"prepare",raw:"Linux зарегистрировал нехватку памяти во время подготовки")
+        XCTAssertTrue(memory.contains("Linux"));XCTAssertFalse(memory.contains("USB"))
+    }
+
 }

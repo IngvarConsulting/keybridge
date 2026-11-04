@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 import AppKit
 import SwiftUI
+import KeyBridgeCore
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -8,13 +9,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var mainWindow: NSWindow?
     private var mayTerminate = false
     private var finishingQuit = false
+    private var sessionTerminationPending = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Self.shared = self
-        NSApp.setActivationPolicy(.regular)
-        showWindow()
+        let login = LoginLaunch.isLoginEvent(NSAppleEventManager.shared().currentAppleEvent)
+        NSApp.setActivationPolicy(login ? .accessory : .regular)
+        if login { AppModel.shared.resumeAtLogin() }
+        else { showWindow(); AppModel.shared.restoreControllerIfNeeded() }
     }
     func showWindow() {
+        NSApp.setActivationPolicy(.regular)
         if mainWindow == nil {
             let style: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable]
             let frame = NSRect(x: 0, y: 0, width: 760, height: 560)
@@ -46,6 +51,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if mayTerminate { return .terminateNow }
+        if sessionTerminationPending { return .terminateLater }
+        if LoginLaunch.isSessionTerminationEvent(NSAppleEventManager.shared().currentAppleEvent) {
+            sessionTerminationPending = true
+            AppModel.shared.endSession { [weak self] succeeded in
+                self?.sessionTerminationPending = false
+                self?.mayTerminate = succeeded
+                sender.reply(toApplicationShouldTerminate: succeeded)
+            }
+            return .terminateLater
+        }
         AppModel.shared.requestQuit()
         return .terminateCancel
     }

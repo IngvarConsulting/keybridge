@@ -11,5 +11,6 @@ let package = Package(
               .executableTarget(name: "KeyBridgeAgent", dependencies: ["KeyBridgeCore"]),
               .executableTarget(name: "KeyBridgeControl", dependencies: ["KeyBridgeCore"]),
               .executableTarget(name: "KeyBridgeConfigure", dependencies: ["KeyBridgeCore"]),
-              .testTarget(name: "KeyBridgeCoreTests", dependencies: ["KeyBridgeCore"])],
+              .testTarget(name: "KeyBridgeCoreTests", dependencies: ["KeyBridgeCore"]),
+              .testTarget(name: "KeyBridgeAppTests", dependencies: ["KeyBridgeApp"])],
     swiftLanguageVersions: [.v5])

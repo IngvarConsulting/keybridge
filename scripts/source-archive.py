@@ -23,17 +23,16 @@ import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD_ROOT = Path(os.environ.get("KEYBRIDGE_BUILD_ROOT", str(Path.home() / "Library/Caches/KeyBridgeDevelopment"))).expanduser().resolve()
-SOURCE_FILES = ("Package.swift", "README.md", "LICENSE", "THIRD_PARTY.md", ".gitignore",
+SOURCE_FILES = ("Package.swift", "README.md", "AGENTS.md", "LICENSE", "THIRD_PARTY.md", ".gitignore",
                 "Resources/interface/ingvar-consulting.png", "Resources/app-icon.png")
-SOURCE_GLOBS = ("Sources/**/*.swift", "Resources/guest/*.py", "Resources/guest/*.sh",
-                "Resources/interface/*.html", "Resources/interface/*.js", "Resources/interface/*.css",
-                "Tests/Interface/*.js", "Tests/Interface/*.cjs", "Tests/Interface/*.html",
+SOURCE_GLOBS = ("Sources/**/*.swift", "Resources/guest/*.py", "Resources/guest/*.sh", "Resources/probe/**/*.xml", "Resources/probe/**/*.bsl", "Resources/probe/*.md",
                 "Tests/**/*.swift", "Tests/**/*.py", "scripts/*.py", "scripts/*.sh",
                 "arch/**/*.md", ".github/workflows/*.yml")
 MACHO = {b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
          b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"}
 FORBIDDEN_MAGICS = MACHO | {b"\x7fELF", b"QFI\xfb", b"!<ar"}
 PRODUCTS = {"KeyBridgeApp", "KeyBridgeAgent", "KeyBridgeControl", "KeyBridgeConfigure"}
+DEFAULT_BUNDLE_IDENTIFIER = "pro.keybridge.pilot"
 RUNTIME_EXECUTABLES = {"qemu-system-x86_64", "qemu-img"}
 RUNTIME_LIBRARIES = set("""libcapstone.5.dylib libgnutls.30.dylib libpng16.16.dylib
 libpixman-1.0.dylib libjpeg.8.3.2.dylib libsnappy.1.3.1.dylib liblzo2.2.dylib
@@ -45,13 +44,14 @@ libgmp.10.dylib libpcre2-8.0.dylib libcrypto.4.dylib""".split())
 BASE_IMAGES = {"alpine.qcow2", "vmlinuz-virt", "initramfs-virt"}
 BASE_TEXT = {"manifest.json", "alpine-packages.txt", "alpine-package-details.txt"}
 FIRMWARE = {"bios-256k.bin", "bios.bin", "kvmvapic.bin", "vgabios-stdvga.bin", "efi-virtio.rom", "linuxboot_dma.bin"}
-GUEST = {"key_info.py", "license_evidence.py", "sentinel_guard.py",  "rmlic_ready.sh", "verify_imports.sh",  "alpine_service.sh", "alpine_hasp_hotplug.sh", "alpine_ready.py", "alpine_provision.sh", "alpine_bootstrap.sh"}
+GUEST = {"health.py", "key_info.py", "license_evidence.py", "sentinel_guard.py",  "rmlic_ready.sh", "verify_imports.sh",  "alpine_service.sh", "alpine_hasp_hotplug.sh", "alpine_ready.py", "alpine_provision.sh", "alpine_bootstrap.sh"}
+PROBE = {"LicenseProbe.xml", "LicenseProbe/Forms/Probe.xml", "LicenseProbe/Forms/Probe/Ext/Form.xml", "LicenseProbe/Forms/Probe/Ext/Form/Module.bsl"}
 PACKAGES = set("""capstone-5.0.9 dtc-1.8.1 gettext-1.0 glib-2.90.1 gmp-6.3.0 gnutls-3.8.13_2
 jpeg-turbo-3.2.0 libidn2-2.3.8 libpng-1.6.59 libslirp-4.9.5 libssh-0.12.2_1 libtasn1-4.21.0
 libunistring-1.5 libusb-1.0.30 lzo-2.10 ncurses-6.6 nettle-4.0 openssl@4-4.0.3 p11-kit-0.26.5
 pcre2-10.49 pixman-0.46.4 qemu-11.1.2 snappy-1.3.1 vde-2.3.3 zstd-1.5.7_1""".split())
 ROOT_BUNDLE_FILES = {"Contents/Info.plist", "Contents/PkgInfo", "Contents/_CodeSignature/CodeResources",
-    "Contents/Library/LaunchAgents/pro.keybridge.pilot.agent.plist", "Contents/Resources/LICENSE",
+    "Contents/Resources/LICENSE",
     "Contents/Resources/THIRD_PARTY.md", "Contents/Resources/build-inventory.json",
     "Contents/Resources/.keybridge-build-marker", "Contents/Resources/ThirdParty/packages.json"}
 
@@ -190,12 +190,25 @@ def export_source(destination: Path) -> dict:
             "sha256": digest(destination.read_bytes()), "paths": [name for name, _, _ in payload]}
 
 
-def approved_category(name: str) -> str | None:
+def product_identifiers(bundle_identifier: str) -> dict[str, str]:
+    if (not isinstance(bundle_identifier, str) or len(bundle_identifier) > 200
+            or not re.fullmatch(r"(?:[A-Za-z][A-Za-z0-9-]*\.)+[A-Za-z][A-Za-z0-9-]*", bundle_identifier)):
+        raise ValueError("Application must declare a valid reverse-DNS bundle identifier")
+    return {name: bundle_identifier + suffix for name, suffix in (
+        ("KeyBridgeApp", ""), ("KeyBridgeAgent", ".agent"), ("KeyBridgeControl", ".control"),
+        ("KeyBridgeConfigure", ".configure"))}
+
+
+def agent_plist_path(bundle_identifier: str) -> str:
+    return "Contents/Library/LaunchAgents/" + bundle_identifier + ".agent.plist"
+
+
+def approved_category(name: str, bundle_identifier: str = DEFAULT_BUNDLE_IDENTIFIER) -> str | None:
     if name.startswith("Contents/Resources/base/"):
         relative = name[len("Contents/Resources/base/"):]
         if relative in BASE_IMAGES: return "linux-image"
         if relative in BASE_TEXT or (relative.startswith("notices/") and Path(relative).name in {"copyright", "debian-packages.txt", "debian-source-packages.txt"}): return "linux-base-text"
-    if name in ROOT_BUNDLE_FILES:
+    if name in ROOT_BUNDLE_FILES or name == agent_plist_path(bundle_identifier):
         return "metadata"
     p = Path(name)
     if p.parent.as_posix() == "Contents/MacOS" and p.name in PRODUCTS:
@@ -208,8 +221,8 @@ def approved_category(name: str) -> str | None:
         return "firmware"
     if p.parent.as_posix() == "Contents/Resources/guest" and p.name in GUEST:
         return "guest-source"
-    if p.parent.as_posix() == "Contents/Resources/interface" and p.name in {"keybridge.html", "keybridge.js"}:
-        return "interface-source"
+    if name.removeprefix("Contents/Resources/probe/") in PROBE and name.startswith("Contents/Resources/probe/"):
+        return "probe-source"
     if name == "Contents/Resources/interface/ingvar-consulting.png":
         return "brand-image"
     if name == "Contents/Resources/AppIcon.icns":
@@ -231,6 +244,9 @@ def execute(*args: str | Path) -> str:
 def audit_app(app: Path) -> dict:
     if app.is_symlink() or not app.is_dir():
         raise ValueError("Application must be a regular directory")
+    info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+    identifiers = product_identifiers(info.get("CFBundleIdentifier"))
+    bundle_identifier = identifiers["KeyBridgeApp"]
     inventory = []
     bad_files = []
     bad_links = []
@@ -248,7 +264,7 @@ def audit_app(app: Path) -> dict:
             bad_files.append({"file": name, "reason": "not a regular file"})
             continue
         data = path.read_bytes()
-        category = approved_category(name)
+        category = approved_category(name, bundle_identifier)
         inventory.append({"file": name, "bytes": len(data), "sha256": digest(data)})
         if category is None:
             bad_files.append({"file": name, "reason": "not on independent bundle allowlist"})
@@ -262,6 +278,13 @@ def audit_app(app: Path) -> dict:
             architectures[arch] = architectures.get(arch, 0) + 1
             if arch != "arm64":
                 bad_files.append({"file": name, "reason": "not ARM64-only"})
+            if path.parent == app / "Contents/MacOS":
+                signature_info = subprocess.run(["/usr/bin/codesign", "--display", "--verbose=2", str(path)],
+                                                text=True, capture_output=True)
+                identifier = re.search(r"(?m)^Identifier=(.*)$", signature_info.stderr)
+                if (signature_info.returncode != 0 or identifier is None
+                        or identifier.group(1) != identifiers[path.name]):
+                    bad_files.append({"file": name, "reason": "unexpected product signing identifier"})
             for line in execute("/usr/bin/otool", "-L", path).splitlines()[1:]:
                 dependency = line.strip().split(" (compatibility version", 1)[0]
                 if dependency.startswith(("/System/Library/", "/usr/lib/")):
@@ -289,21 +312,33 @@ def audit_app(app: Path) -> dict:
                 bad_files.append({"file": name, "reason": "binary in text/metadata allowlist"})
             if re.search(rb"(?m)^-----BEGIN (?:OPENSSH |RSA |EC )?PRIVATE KEY-----", data):
                 bad_files.append({"file": name, "reason": "private key material"})
-    required = ROOT_BUNDLE_FILES | {"Contents/MacOS/" + x for x in PRODUCTS}
-    required |= {"Contents/Resources/interface/keybridge.html", "Contents/Resources/interface/keybridge.js",
-                 "Contents/Resources/interface/ingvar-consulting.png", "Contents/Resources/AppIcon.icns"}
+    required = ROOT_BUNDLE_FILES | {agent_plist_path(bundle_identifier)} | {"Contents/MacOS/" + x for x in PRODUCTS}
+    required |= {"Contents/Resources/interface/ingvar-consulting.png", "Contents/Resources/AppIcon.icns"}
     required |= {"Contents/Resources/runtime/bin/" + x for x in RUNTIME_EXECUTABLES}
     required |= {"Contents/Resources/runtime/lib/" + x for x in RUNTIME_LIBRARIES}
     required |= {"Contents/Resources/runtime/share/qemu/" + x for x in FIRMWARE}
     required |= {"Contents/Resources/guest/" + x for x in GUEST}
+    required |= {"Contents/Resources/probe/" + x for x in PROBE}
     required |= {"Contents/Resources/base/" + x for x in BASE_IMAGES | BASE_TEXT}
     present = {entry["file"] for entry in inventory}
     for name in sorted(required - present):
         bad_files.append({"file": name, "reason": "required bundle file missing"})
     manifest_path = app / "Contents/Resources/build-inventory.json"
-    if plistlib.loads((app / "Contents/Info.plist").read_bytes()).get("CFBundleIconFile") != "AppIcon.icns":
+    if info.get("CFBundleIconFile") != "AppIcon.icns":
         bad_files.append({"file": "Contents/Info.plist", "reason": "application icon is not configured"})
+    if info.get("CFBundleExecutable") != "KeyBridgeApp":
+        bad_files.append({"file": "Contents/Info.plist", "reason": "unexpected application executable"})
+    try:
+        agent = plistlib.loads((app / agent_plist_path(bundle_identifier)).read_bytes())
+        if (agent.get("Label") != identifiers["KeyBridgeAgent"]
+                or agent.get("BundleProgram") != "Contents/MacOS/KeyBridgeAgent"):
+            raise ValueError("agent registration does not match the application identity")
+    except (OSError, ValueError, plistlib.InvalidFileException) as exc:
+        bad_files.append({"file": agent_plist_path(bundle_identifier), "reason": str(exc)})
     manifest = json.loads(manifest_path.read_text())
+    if any(Path(name).suffix.lower() in {".html", ".js", ".css"}
+           for name in manifest.get("sources_sha256", {}) if name.startswith("Resources/interface/")):
+        bad_files.append({"file": "Contents/Resources/build-inventory.json", "reason": "obsolete web interface in production source inventory"})
     expected_runtime = {name[len("Contents/Resources/"):] for name in required if "/runtime/" in name}
     recorded_runtime = {item["file"] for item in manifest.get("runtime_files", [])}
     if recorded_runtime != expected_runtime:
@@ -319,7 +354,8 @@ def audit_app(app: Path) -> dict:
     signature = subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
     tree = "".join(entry["file"] + "\0" + entry["sha256"] + "\n" for entry in inventory).encode()
-    return {"app": app.name, "passed": not bad_files and not bad_links and signature,
+    return {"app": app.name, "bundle_identifier": bundle_identifier,
+            "passed": not bad_files and not bad_links and signature,
             "read_only": True, "file_count": len(inventory), "bytes": sum(x["bytes"] for x in inventory),
             "categories": categories, "architectures": architectures, "bad_links": bad_links,
             "bad_files": bad_files, "code_signature_valid": signature,

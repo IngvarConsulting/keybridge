@@ -62,19 +62,27 @@ public enum AppPresentation {
         var state: [String: Any] = [
             "phase": phase, "prepared": prepared, "client": client,
             "key": connected && !stale, "want": bool(status, "desiredRunning"),
-            "hold": bool(status, "autoInhibit"), "auto": bool(status, "autostart"),
+            "hold": bool(status, "autoInhibit") || !string(status,"safetyReason").isEmpty, "auto": bool(status, "autostart"),
             "autoAvailable": bool(status, "loginLaunchSupported"),
-            "permission": ["allowed", "denied"].contains(string(status, "loginAccess")) ? string(status, "loginAccess") : "unknown",
+            "permission": ["allowed", "denied", "unregistered"].contains(string(status, "loginAccess")) ? string(status, "loginAccess") : "unknown",
             "proof": proof, "saved": saved, "selected": "current",
             "step": preparationStep(preparation?.phase ?? string(status, "phase")),
             "updated": status["updatedInstallation"] as? Bool ?? previous,
             "previousAvailable": previous, "previousValid": bool(status, "previousValid"),
             "updateProblem": updateProblem, "backupAvailable": bool(status, "backupAvailable"),
             "backupState": string(status, "backupState", fallback: "unknown"),
+            "configurationDirectory": string(status,"configurationDirectory"),
+            "configurationFiles": status["configurationFiles"] as? [String] ?? [],
+            "platformVersion": string(status,"platformVersion"),
+            "configurationError": string(status,"configurationError"),
             "pendingQuit": false, "sessionActive": status["sessionActive"] as? Bool ?? true,
+            "sessionAvailability": string(status, "sessionAvailability", fallback: status["sessionActive"] as? Bool == false ? "unavailable" : ""),
+            "sessionReason": string(status, "sessionReason"),
             "contextVersion": contextKey(status), "ownership": ownership,
             "running": running && !stale, "stale": stale,
+            "dataError": string(status, "runtimeDataError"),
             "busy": bool(status, "busy"), "operation": operation,
+            "operationPending": false,
             "safetyBlock": stale || ownership == "unknown" ? "unknown" : NSNull(),
             "errorMessage": "", "installerIssue": "", "accessError": NSNull()
         ]
@@ -89,24 +97,37 @@ public enum AppPresentation {
         }
         if bool(status, "clientRestored") { state["clientRestored"] = true }
         let probe = status["lastProbe"] as? [String: Any] ?? [:]
+        state["proofSaveError"] = string(probe,"saveError").isEmpty ? "" : "Результат получен, но не сохранён. После перезапуска он может быть недоступен."
+        state["pendingDiagnostic"] = string(status,"pendingDiagnostic")
         return ["state": state,
                 "keyLabel": stale ? "Нет актуальных данных" : string(status, "keyModel", fallback: connected ? "USB-ключ HASP" : "Не подтверждён"),
                 "componentLabel": componentLabel(status),
                 "proofTime": dateText(probe["timestamp"]),
-                "resourceRows": resourceRows(status)]
+                "resourceRows": resourceRows(status),
+                "resourcesNote": string(status,"resourcesSaveError").isEmpty ? "":"Измерение получено, но не сохранено. После перезапуска оно может быть недоступно."]
     }
 
     /// Classifies a failed real operation without exposing paths, stderr or
     /// claiming a specific cause when the backend did not establish it.
     public static func failureMessage(action: String, raw: String) -> String {
+        if action == "probe", raw.localizedCaseInsensitiveContains("контроллер занят") {
+            return "Проверка 1С не началась: KeyBridge ещё выполняет другое действие. Подождите несколько секунд и нажмите «Проверить в 1С»."
+        }
         switch installerIssue(action: action, raw: raw) {
         case "missing-license-manager":
-            return "Выбранный установщик 1С не содержит нужный менеджер лицензий. Выберите другой установщик 1С для Linux x86-64 с этим компонентом."
+            return "Выбранный установщик 1С не содержит нужный менеджер лицензий. Выберите полную поставку платформы 1С 8.5.4 или новее для Linux x86-64 с менеджером лицензий rmlic."
         case "ambiguous-license-manager":
-            return "Установщик добавил несколько менеджеров лицензий. KeyBridge не может выбрать нужный. Выберите другой установщик 1С для Linux x86-64 с одним менеджером лицензий."
+            return "Установщик добавил несколько менеджеров лицензий. KeyBridge не может выбрать нужный. Выберите другую полную поставку платформы 1С 8.5.4 или новее для Linux x86-64 с одним менеджером лицензий rmlic."
         default: break
         }
         let text = raw.lowercased()
+        if raw.contains(AgentIdentity.restartMessage) { return AgentIdentity.restartMessage }
+        if text.contains("linux") && (text.contains("не хватает места") || text.contains("no space")) {
+            return "Внутри Linux не хватает места для выбранных компонентов. Текущая установка сохранена; подготовьте подходящий комплект компонентов заново."
+        }
+        if text.contains("linux") && text.contains("нехватку памяти") {
+            return "Linux сообщил о нехватке памяти при подготовке. Подготовка остановлена; текущая установка сохранена."
+        }
         if text.contains("no space") || text.contains("enospc") || text.contains("не хватает места") || text.contains("недостаточно места") {
             return "На Mac не хватает свободного места. Освободите место и повторите действие."
         }
@@ -128,11 +149,11 @@ public enum AppPresentation {
         if ["installer", "driver"].contains(action), text.contains("поврежд") || text.contains("не полностью") || text.contains("метаданн") {
             return action == "driver"
                 ? "Не удалось прочитать содержимое драйвера: структура файла не распознана. Скачайте пакет aksusbd для amd64 заново и выберите его."
-                : "Не удалось прочитать установщик 1С: структура файла не распознана. Скачайте полную поставку для Linux x86-64 заново и выберите её."
+                : "Не удалось прочитать установщик 1С: структура файла не распознана. Скачайте полную поставку платформы 1С 8.5.4 или новее для Linux x86-64 заново и выберите её."
         }
         if ["prepare", "installer", "driver"].contains(action), text.contains("amd64") || text.contains("архитектур") || text.contains("x86-64") {
             if action == "driver" { return "Формат или архитектура драйвера не подходят. Выберите DEB-пакет aksusbd для Linux amd64." }
-            if action == "installer" { return "Формат или архитектура установщика не подходят. Выберите полную поставку 1С для Linux x86-64 в файле .run." }
+            if action == "installer" { return "Формат или архитектура установщика не подходят. Выберите полную поставку платформы 1С 8.5.4 или новее для Linux x86-64 в файле .run." }
             return "Формат или архитектура выбранного файла не подходят. Проверьте установщик для Linux x86-64 и драйвер amd64."
         }
         if action == "check-client", text.contains("не найден") || text.contains("не установлен") || text.contains("missing") {
@@ -142,7 +163,7 @@ public enum AppPresentation {
             return "USB-ключ HASP не обнаружен. Подключите его к этому Mac и повторите проверку подключения."
         }
         switch action {
-        case "installer": return "Не удалось прочитать или проверить установщик 1С. Причина пока неизвестна. Скачайте полную поставку для Linux x86-64 и выберите файл заново."
+        case "installer": return "Не удалось прочитать или проверить установщик 1С. Причина пока неизвестна. Скачайте полную поставку платформы 1С 8.5.4 или новее для Linux x86-64 и выберите файл заново."
         case "driver": return "Не удалось прочитать или проверить драйвер HASP. Причина пока неизвестна. Скачайте пакет aksusbd для Linux amd64 и выберите файл DEB заново."
         case "check-client": return "Не удалось проверить клиент 1С для macOS. Причина пока неизвестна. Проверьте, что 1С установлена, и повторите проверку наличия."
         case "check-key": return "Не удалось проверить подключение USB-ключа. Причина пока неизвестна. Переподключите ключ к Mac и повторите проверку подключения."
@@ -177,17 +198,21 @@ public enum AppPresentation {
 
     private static func phase(_ status: [String: Any], preparation: PreparationSnapshot?, historicalInstallerFailure: Bool) -> String {
         guard !status.isEmpty else { return "loading" }
+        let stopping = bool(status, "busy") && !bool(status, "stale") &&
+            ["stop", "shutdown", "session-stop", "session-shutdown"].contains(string(status, "operation"))
+        if !string(status, "runtimeDataError").isEmpty && !stopping { return "data-error" }
         if bool(status, "stale") { return "unknown" }
         let operation = string(status, "operation")
         let raw = string(status, "status")
         let ownership = string(status, "ownership")
         let running = bool(status, "running")
         let busy = bool(status, "busy")
+        if bool(status, "agentNeedsRestart"), ["owned", "absent"].contains(ownership) { return "agent-update" }
         if busy {
             switch operation {
             case "prepare": return "preparing"
             case "rollback": return "restoring-version"
-            case "stop", "shutdown", "session-stop": return "stopping"
+            case "stop", "shutdown", "session-stop", "session-shutdown": return "stopping"
             case "start": return "starting"
             case "probe": return "probing"
             case "configure", "repair": return "configuring"
@@ -230,6 +255,7 @@ public enum AppPresentation {
             if integer(status["remainingAttempts"]) == 0 && bool(status, "autoInhibit") { return "exhausted" }
             return "start-error"
         }
+        if !string(status,"safetyReason").isEmpty { return integer(status["remainingAttempts"]) == 0 ? "exhausted":"stopped" }
         if !bool(status, "prepared") { return "first" }
         guard ownership == "absent" else { return "unknown" }
         return "stopped"
@@ -248,18 +274,15 @@ public enum AppPresentation {
             }
         }
         if ["success", "licensed"].contains(result) {
-            // A boolean or observed aggregate issuance alone is not the agreed
-            // causal license proof. Existing backend intentionally cannot yet
-            // satisfy this branch (the documented G06 gap).
             let context = probe["contextAfter"] as? [String: Any] ?? [:]
-            let connection = string(status, "keyConnection")
-            let boundToRun = !string(status, "generation").isEmpty && !string(status, "runID").isEmpty && !connection.isEmpty &&
-                string(context, "generation") == string(status, "generation") && string(context, "run") == string(status, "runID") &&
-                string(context, "usb") == connection
-            let confirmed = boundToRun && bool(probe, "success") && bool(probe, "clientOperationSucceeded") &&
-                bool(probe, "journalContinuous") && bool(probe, "contextStable") &&
-                bool(probe, "causalIsolation") && (integer(probe["managerIssuanceDelta"]) ?? 0) > 0 &&
-                (integer(probe["hardwareLocalDelta"]) ?? 0) > 0
+            let connection=status["keyConnection"]
+            let boundToRun = !string(status,"generation").isEmpty && !string(status,"runID").isEmpty &&
+                connection != nil && context["usb"] != nil &&
+                string(context,"generation")==string(status,"generation") && string(context,"run")==string(status,"runID") &&
+                NSDictionary(dictionary:["usb":connection!]).isEqual(to:["usb":context["usb"]!])
+            let confirmed = boundToRun && bool(probe,"success") && bool(probe,"clientOperationSucceeded") &&
+                bool(probe,"contextStable") && bool(probe,"causalIsolation") &&
+                string(probe,"evidenceMethod")=="client-license-monitoring"
             return confirmed ? "success" : "unconfirmed"
         }
         if ["timeout", "timedOut"].contains(result) || bool(probe, "timedOut") { return "timeout" }
@@ -279,7 +302,7 @@ public enum AppPresentation {
 
     private static func contextKey(_ status: [String: Any]) -> String {
         var context = [String: Any]()
-        for key in ["generation", "runID", "ownership", "keyConnected", "keyConnection", "usbEpoch", "clientState", "clientRevision", "sessionActive", "stale"] {
+        for key in ["generation", "runID", "ownership", "keyConnected", "keyConnection", "usbEpoch", "clientState", "clientRevision", "sessionActive", "stale", "runtimeDataError"] {
             context[key] = status[key] ?? NSNull()
         }
         guard let data = try? JSONSerialization.data(withJSONObject: context, options: [.sortedKeys]),

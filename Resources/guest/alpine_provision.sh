@@ -4,9 +4,17 @@
 set -eu
 phase=verify_imports
 swap=/var/lib/keybridge/install.swap
+oom_before=$(awk '$1=="oom_kill" {print $2}' /proc/vmstat)
+free_kib() { df -Pk / | awk 'NR==2 {print $4}'; }
 cleanup() {
   code=$?
   trap - EXIT
+  if test "$code" -ne 0; then
+    # Preserve the failure location before releasing temporary swap space.
+    if test "$(free_kib)" -eq 0; then printf 'KEYBRIDGE_ERROR=guest_disk_full\n' >&2; fi
+    oom_after=$(awk '$1=="oom_kill" {print $2}' /proc/vmstat)
+    if test "${oom_after:-0}" -gt "${oom_before:-0}"; then printf 'KEYBRIDGE_ERROR=guest_memory\n' >&2; fi
+  fi
   if test -f "$swap"; then swapoff "$swap" 2>/dev/null || true; rm -f "$swap"; fi
   if test "$code" -ne 0; then
     printf 'KEYBRIDGE_ERROR=stage_%s code=%s\n' "$phase" "$code" >&2
@@ -28,6 +36,14 @@ mkdir -p /mnt/import /var/lib/keybridge
 mount -o ro "$(blkid -L keybridge)" /mnt/import
 cd /mnt/import
 sha256sum -c sha256sums
+# Reserve the known allocation (temporary swap and the driver). The vendor
+# installer's final size is not advertised, so later allocation failures remain explicit.
+driver_kib=$(dpkg-deb -f runtime.deb Installed-Size 2>/dev/null || true)
+case "$driver_kib" in ''|*[!0-9]*) driver_kib=0 ;; esac
+if test "$(free_kib)" -lt "$((524288 + driver_kib))"; then
+  printf 'KEYBRIDGE_ERROR=guest_disk_full\n' >&2
+  exit 1
+fi
 dd if=/dev/zero of="$swap" bs=1M count=512 2>/dev/null
 chmod 600 "$swap"
 mkswap "$swap" >/dev/null

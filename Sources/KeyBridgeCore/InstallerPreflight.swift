@@ -146,7 +146,7 @@ public enum InstallerPreflight {
         transcript = try readOutput()
         try checkCancellation()
         if transcript.contains("KEYBRIDGE_ERROR=missing_license_manager") {
-            throw BridgeError("В выбранном установщике 1С нет менеджера лицензий. Выберите другой дистрибутив 1С для Linux x86-64 с этим компонентом.")
+            throw BridgeError("В выбранном установщике 1С нет менеджера лицензий. Выберите полную поставку платформы 1С 8.5.4 или новее для Linux x86-64: в ней появился rmlic.")
         }
         if transcript.contains("KEYBRIDGE_ERROR=invalid_platform_installer") {
             throw BridgeError("Файл не подтвердил, что это исправный установщик 1С. Скачайте дистрибутив 1С для Linux x86-64 заново и выберите его.")

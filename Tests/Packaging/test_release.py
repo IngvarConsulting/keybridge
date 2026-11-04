@@ -20,7 +20,8 @@ spec.loader.exec_module(release)
 class ReleasePackagingTests(unittest.TestCase):
     @contextmanager
     def package(self, *, dirty=False, changed_source=False, initial_audit=True,
-                installed_tree="same", stale=True):
+                installed_tree="same", stale=True, bundle_identifier="pro.keybridge.pilot",
+                missing_source=False, reused_build=False, adhoc=True):
         """Run the packaging workflow with OS commands replaced, without a VM."""
         with tempfile.TemporaryDirectory() as temporary, ExitStack() as stack:
             folder = Path(temporary)
@@ -33,11 +34,14 @@ class ReleasePackagingTests(unittest.TestCase):
             app = folder / "KeyBridge.app"
             resources = app / "Contents/Resources"
             resources.mkdir(parents=True)
-            (app / "Contents/Info.plist").write_bytes(plistlib.dumps({
+            info = {
+                "CFBundleIdentifier": bundle_identifier,
                 "CFBundleShortVersionString": "0.1.0", "LSMinimumSystemVersion": "27.0",
-                "KeyBridgeLoginLaunchSupported": False}))
+                "KeyBridgeLoginLaunchSupported": True}
+            (app / "Contents/Info.plist").write_bytes(plistlib.dumps(info))
             (resources / "build-inventory.json").write_text(json.dumps({
-                "sources_sha256": {"source.swift": expected}}))
+                "signature": "ad-hoc", "notarized": False, "compiled_from_sources": not reused_build,
+                "sources_sha256": {} if missing_source else {"source.swift": expected}}))
             for name in ("LICENSE", "THIRD_PARTY.md"):
                 (checkout / name).write_text(name)
                 (resources / name).write_text(name)
@@ -69,16 +73,18 @@ class ReleasePackagingTests(unittest.TestCase):
                 return (" M source.swift\n" if dirty else "") if args[1] == "status" else "a" * 40 + "\n"
 
             stack.enter_context(patch.object(release, "ROOT", checkout))
-            stack.enter_context(patch.object(release, "load_auditor", return_value=auditor))
-            catalog = stack.enter_context(patch.object(release, "load_source_links",
-                return_value=SimpleNamespace(write_catalog=Mock(side_effect=write_catalog))))
+            catalog = SimpleNamespace(write_catalog=Mock(side_effect=write_catalog))
+            scripts = {"source-archive": auditor, "component-sources": catalog,
+                       "build-app": SimpleNamespace(production_source_paths=lambda: [checkout / "source.swift"])}
+            stack.enter_context(patch.object(release, "load_script", side_effect=scripts.__getitem__))
+            stack.enter_context(patch.object(release, "is_adhoc_signed", return_value=adhoc))
             stack.enter_context(patch.object(release, "run", side_effect=run))
             boot = stack.enter_context(patch.object(release, "boot_open_base"))
             stack.enter_context(patch.object(release.subprocess, "check_output", side_effect=git))
             control = stack.enter_context(patch.object(release.subprocess, "run",
                 return_value=SimpleNamespace(stdout=json.dumps({"stale": stale}))))
             stack.enter_context(patch("sys.argv", ["package-release.py", "--app", str(app),
-                "--version", "0.1.0-beta.2", "--output", str(output)]))
+                "--version", "0.1.0-rc.1", "--output", str(output)]))
             stack.enter_context(redirect_stdout(io.StringIO()))
             yield SimpleNamespace(output=output, auditor=auditor, commands=commands,
                                   boot=boot, control=control, catalog=catalog)
@@ -87,7 +93,7 @@ class ReleasePackagingTests(unittest.TestCase):
         with self.package() as state:
             release.main()
             self.assertEqual({p.name for p in state.output.iterdir()}, {
-                "KeyBridge-0.1.0-beta.2-macOS-arm64.dmg", "COMPONENT-SOURCES.md",
+                "KeyBridge-0.1.0-rc.1-macOS-arm64.dmg", "COMPONENT-SOURCES.md",
                 "INSTALL.txt", "release-audit.json", "SHA256SUMS.txt"})
             report = json.loads((state.output / "release-audit.json").read_text())
             self.assertEqual(report["source_repository"],
@@ -105,7 +111,10 @@ class ReleasePackagingTests(unittest.TestCase):
 
     def test_dirty_checkout_or_source_mismatch_still_blocks_packaging(self):
         for options, error in (({"dirty": True}, "Commit the reviewed"),
-                               ({"changed_source": True}, "different source")):
+                               ({"changed_source": True}, "different source"),
+                               ({"missing_source": True}, "different source"),
+                               ({"reused_build": True}, "reused compiled binaries"),
+                               ({"adhoc": False}, "ad-hoc signed preview")):
             with self.subTest(options=options), self.package(**options) as state:
                 with self.assertRaisesRegex(ValueError, error):
                     release.main()
@@ -119,6 +128,13 @@ class ReleasePackagingTests(unittest.TestCase):
                 release.main()
             self.assertFalse(state.output.exists())
             self.assertEqual(state.commands, [])
+
+    def test_isolated_acceptance_identity_cannot_be_published_as_production(self):
+        with self.package(bundle_identifier="pro.keybridge.acceptance") as state:
+            with self.assertRaisesRegex(ValueError, "production application identity"):
+                release.main()
+            self.assertFalse(state.output.exists())
+            state.auditor.audit_app.assert_not_called()
 
     def test_changed_installed_copy_detaches_image_and_blocks_release_report(self):
         with self.package(installed_tree="different") as state:

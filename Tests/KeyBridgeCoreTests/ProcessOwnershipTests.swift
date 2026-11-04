@@ -30,6 +30,68 @@ final class ProcessOwnershipTests: XCTestCase {
         XCTAssertTrue(HostProcessInspector.classify([snapshot(runtime.appendingPathComponent("other"))],runtime:runtime).isAbsent)
         XCTAssertEqual(HostProcessInspector.classify([snapshot(runtime),snapshot(runtime)],runtime:runtime).name,"unknown")
     }
+    func testRawMacOSTemporaryAliasFindsEngineArgumentsBeforeAndAfterDataRemoval() throws {
+        let raw = URL(fileURLWithPath: "/private/tmp/KeyBridgeOwnershipAlias-" + UUID().uuidString)
+        try BridgePaths.preparePrivateDirectory(raw)
+        defer { try? FileManager.default.removeItem(at: raw) }
+        // This is the exact normalization performed by VMEngine.init. No VM or
+        // engine is created: argv is a captured-process fixture only.
+        let engineRuntime = raw.standardizedFileURL
+        XCTAssertNotEqual(raw.path, engineRuntime.path, "The fixture must exercise Foundation's real /private/tmp alias")
+        let generation = UUID().uuidString
+        let process = snapshot(engineRuntime, generation: generation)
+        XCTAssertTrue(HostProcessInspector.matchesEndpoint(process.arguments, runtime: raw),
+                      "Live enumeration must not discard the process before classify")
+        guard case .owned(_, let found, _) = HostProcessInspector.classify([process], runtime: raw) else {
+            return XCTFail("Raw caller path must observe the VMEngine-standardized QMP and generation paths")
+        }
+        XCTAssertEqual(found, generation)
+
+        try FileManager.default.removeItem(at: raw)
+        // Foundation stops normalizing the missing full path, while argv of a
+        // still-running process retains the path used at launch.
+        XCTAssertNotEqual(raw.standardizedFileURL.path, engineRuntime.path)
+        XCTAssertTrue(HostProcessInspector.matchesEndpoint(process.arguments, runtime: raw))
+        XCTAssertEqual(HostProcessInspector.classify([process], runtime: raw).name, "owned",
+                       "External data removal must never manufacture proof of physical stop")
+    }
+
+    func testAliasMatchingWorksInBothDirectionsWithoutAdoptingAnotherRuntime() throws {
+        let raw = URL(fileURLWithPath: "/private/tmp/KeyBridgeOwnershipAlias-" + UUID().uuidString)
+        try BridgePaths.preparePrivateDirectory(raw)
+        defer { try? FileManager.default.removeItem(at: raw) }
+        let canonical = raw.standardizedFileURL
+        let rawProcess = snapshot(raw)
+        XCTAssertTrue(HostProcessInspector.matchesEndpoint(rawProcess.arguments, runtime: canonical))
+        XCTAssertEqual(HostProcessInspector.classify([rawProcess], runtime: canonical).name, "owned")
+        XCTAssertTrue(HostProcessInspector.classify([rawProcess], runtime: canonical.appendingPathExtension("other")).isAbsent)
+        XCTAssertEqual(HostProcessInspector.classify([rawProcess, snapshot(canonical)], runtime: raw).name, "unknown",
+                       "Equivalent path spellings must still expose multiple owners")
+    }
+
+    func testNormalizedQMPStillRequiresGenerationDiskFromTheSameRuntime() throws {
+        let raw = URL(fileURLWithPath: "/private/tmp/KeyBridgeOwnershipAlias-" + UUID().uuidString)
+        try BridgePaths.preparePrivateDirectory(raw)
+        defer { try? FileManager.default.removeItem(at: raw) }
+        let process = snapshot(raw.standardizedFileURL)
+        let foreignDisk = snapshot(raw.appendingPathExtension("other")).arguments.last!
+        let altered = ProcessSnapshot(identity: process.identity, arguments: Array(process.arguments.dropLast()) + [foreignDisk])
+        XCTAssertTrue(HostProcessInspector.matchesEndpoint(altered.arguments, runtime: raw))
+        XCTAssertEqual(HostProcessInspector.classify([altered], runtime: raw).name, "unknown")
+    }
+
+    func testNormalizedGenerationDiskPreservesQEMUCommaEscaping() throws {
+        let folder = runtime.appendingPathComponent("with,comma")
+        try BridgePaths.preparePrivateDirectory(folder)
+        let generation = UUID().uuidString
+        let process = snapshot(folder, generation: generation)
+        let escaped = process.arguments.last!.replacingOccurrences(of: "with,comma", with: "with,,comma")
+        let actual = ProcessSnapshot(identity: process.identity, arguments: Array(process.arguments.dropLast()) + [escaped])
+        guard case .owned(_, let found, _) = HostProcessInspector.classify([actual], runtime: folder) else {
+            return XCTFail("Comma escaping belongs to QEMU syntax, not the filesystem path")
+        }
+        XCTAssertEqual(found, generation)
+    }
     func testStopStillRunsWhenIntentWriteFailsAndReportsBothErrors() {
         var stopped = false
         let errors = StopTransaction.perform(persist: { throw BridgeError("disk full") }, stop: { stopped = true; throw BridgeError("USB unknown") })

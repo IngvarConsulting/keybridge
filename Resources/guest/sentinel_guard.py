@@ -179,9 +179,7 @@ def configure(result):
     require_no_sentinel_usb()
     try:
         completed = subprocess.run(
-            (["sudo", "-n", "/usr/local/sbin/keybridge-services", "restart-runtime"]
-             if Path('/etc/alpine-release').is_file()
-             else ["sudo", "-n", "systemctl", "restart", "hasplmd"]),
+            ["sudo", "-n", "/usr/local/sbin/keybridge-services", "restart-runtime"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
