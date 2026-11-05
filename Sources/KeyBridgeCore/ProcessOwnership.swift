@@ -133,7 +133,18 @@ struct HostProcessInspector {
     }
     static func kernelSummary(_ pid:pid_t)->KernelProcessSummary? {
         var info=proc_bsdinfo()
-        guard proc_pidinfo(pid,PROC_PIDTBSDINFO,0,&info,Int32(MemoryLayout<proc_bsdinfo>.size))==Int32(MemoryLayout<proc_bsdinfo>.size) else {return nil}
+        if proc_pidinfo(pid,PROC_PIDTBSDINFO,0,&info,Int32(MemoryLayout<proc_bsdinfo>.size)) != Int32(MemoryLayout<proc_bsdinfo>.size) {
+            // proc_pidinfo can no longer read an unreaped process. sysctl still
+            // reports its kernel exit state, which cannot retain VM resources.
+            var process = kinfo_proc()
+            var size = MemoryLayout<kinfo_proc>.size
+            var query: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+            guard sysctl(&query, UInt32(query.count), &process, &size, nil, 0) == 0,
+                  size == MemoryLayout<kinfo_proc>.size, process.kp_proc.p_pid == pid,
+                  process.kp_proc.p_stat == SZOMB else { return nil }
+            return KernelProcessSummary(pid: pid, uid: process.kp_eproc.e_ucred.cr_uid,
+                                        status: UInt32(SZOMB), name: "", command: "")
+        }
         func string<T>(_ tuple:inout T)->String {
             withUnsafeBytes(of:&tuple) { bytes in String(decoding:bytes.prefix(while:{$0 != 0}),as:UTF8.self) }
         }

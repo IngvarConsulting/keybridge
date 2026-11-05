@@ -139,6 +139,27 @@ final class ProcessOwnershipTests: XCTestCase {
 }
 
 extension ProcessOwnershipTests {
+    func testUnreapedExitedProcessDoesNotBlockVMAbsence() throws {
+        var child: pid_t = 0
+        let executable = strdup("/usr/bin/true")!
+        defer { free(executable) }
+        var arguments: [UnsafeMutablePointer<CChar>?] = [executable, nil]
+        var environment: [UnsafeMutablePointer<CChar>?] = [nil]
+        let result = posix_spawn(&child, executable, nil, nil, &arguments, &environment)
+        XCTAssertEqual(result, 0)
+        guard result == 0 else { return }
+        defer {
+            var status: Int32 = 0
+            waitpid(child, &status, 0)
+        }
+        let deadline = Date().addingTimeInterval(3)
+        while HostProcessInspector.kernelSummary(child)?.status != UInt32(SZOMB), Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        XCTAssertEqual(HostProcessInspector.kernelSummary(child)?.status, UInt32(SZOMB))
+        XCTAssertFalse(try HostProcessInspector.isQEMUCandidate(child))
+        XCTAssertNoThrow(try HostProcessInspector.processes(runtime: runtime))
+    }
     func testUnlinkedUnrelatedExecutableDoesNotBlockEmptyRuntimeButQEMUStaysUnknown() throws {
         // A live process whose executable was replaced has no proc_pidpath,
         // while the kernel still supplies its identity and executable name.
